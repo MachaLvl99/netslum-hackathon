@@ -51,6 +51,8 @@ services:
         value: 'false'
       - key: MAX_BLOB_SIZE
         value: '5242880'
+      - key: FRONTEND_DIR
+        value: /opt/tranquil-pds/frontend
       - key: JWT_SECRET
         generateValue: true
       - key: DPOP_SECRET

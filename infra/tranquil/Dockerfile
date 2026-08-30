@@ -24,7 +24,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
 
 FROM ${DISTROLESS_IMAGE}
 COPY --from=builder /tmp/tranquil-pds /usr/local/bin/tranquil-pds
-COPY --from=frontend --chown=65532:65532 /app/dist /var/lib/tranquil-pds/frontend
+COPY --from=frontend --chown=65532:65532 /app/dist /opt/tranquil-pds/frontend
 WORKDIR /var/lib/tranquil-pds
 ENV SERVER_HOST=0.0.0.0
 ENV SERVER_PORT=10000
