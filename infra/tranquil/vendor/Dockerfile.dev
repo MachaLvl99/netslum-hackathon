@@ -1,0 +1,19 @@
+FROM rust:1.96-slim-trixie
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    pkg-config \
+    libssl-dev \
+    mold \
+    clang \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN cargo install cargo-watch
+
+ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold"
+ENV SQLX_OFFLINE=true
+
+WORKDIR /app
+
+CMD ["cargo", "watch", "-x", "run -p tranquil-server -- --config /app/config.dev.toml"]

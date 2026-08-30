@@ -1,0 +1,24 @@
+{
+  "name": "@netslum/site-runtime",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --config wrangler.assets.jsonc --port 8791 --inspector-port 9230 --persist-to ../../.wrangler/state",
+    "dev:assets": "wrangler dev --config wrangler.assets.jsonc --port 8791 --inspector-port 9230 --persist-to ../../.wrangler/state",
+    "dev:runtime": "wrangler dev --config wrangler.runtime.jsonc --port 8792 --inspector-port 9231 --persist-to ../../.wrangler/state",
+    "dev:egress": "wrangler dev --config wrangler.egress.jsonc --port 8793 --inspector-port 9232 --persist-to ../../.wrangler/state",
+    "build": "wrangler deploy --dry-run --outdir dist/assets --config wrangler.assets.jsonc && wrangler deploy --dry-run --outdir dist/runtime --config wrangler.runtime.jsonc && wrangler deploy --dry-run --outdir dist/egress --config wrangler.egress.jsonc",
+    "deploy": "wrangler deploy --config wrangler.egress.jsonc && wrangler deploy --config wrangler.assets.jsonc && wrangler deploy --config wrangler.runtime.jsonc",
+    "wrangler:types": "wrangler types --config wrangler.assets.jsonc env.assets.d.ts && wrangler types --config wrangler.runtime.jsonc env.runtime.d.ts && wrangler types --config wrangler.egress.jsonc env.egress.d.ts"
+  },
+  "dependencies": {
+    "@netslum/contracts": "workspace:*",
+    "@netslum/sandbox": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260827.1",
+    "esbuild": "0.28.1",
+    "wrangler": "4.127.0"
+  }
+}

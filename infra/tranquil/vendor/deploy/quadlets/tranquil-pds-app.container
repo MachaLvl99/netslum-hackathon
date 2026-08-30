@@ -1,0 +1,22 @@
+[Unit]
+Description=Tranquil PDS AT Protocol PDS
+After=tranquil-pds-db.service
+[Container]
+ContainerName=tranquil-pds-app
+Image=atcr.io/tranquil.farm/tranquil-pds:latest
+Pod=tranquil-pds.pod
+Environment=SERVER_HOST=[::]
+Environment=SERVER_PORT=3000
+Volume=/srv/tranquil-pds/config/config.toml:/etc/tranquil-pds/config.toml:ro,Z
+Volume=/srv/tranquil-pds/blobs:/var/lib/tranquil-pds/blobs:Z
+Volume=/srv/tranquil-pds/store:/var/lib/tranquil-pds/store:Z
+HealthCmd=wget -q --spider http://localhost:3000/xrpc/_health
+HealthInterval=30s
+HealthTimeout=10s
+HealthRetries=3
+HealthStartPeriod=15s
+[Service]
+Restart=always
+RestartSec=10
+[Install]
+WantedBy=default.target

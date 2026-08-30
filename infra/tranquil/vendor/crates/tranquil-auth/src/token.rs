@@ -1,0 +1,368 @@
+use super::types::{
+    ActClaim, Claims, Header, SigningAlgorithm, TokenScope, TokenType, TokenWithMetadata,
+};
+use anyhow::Result;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::{DateTime, Duration, Utc};
+use hmac::{Hmac, Mac};
+use k256::ecdsa::{Signature, SigningKey, signature::Signer};
+use sha2::Sha256;
+use tranquil_types::{Did, Jti, Nsid};
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub fn create_access_token(did: &Did, key_bytes: &[u8]) -> Result<String> {
+    Ok(create_access_token_with_metadata(did, key_bytes)?.token)
+}
+
+pub fn create_refresh_token(did: &Did, key_bytes: &[u8]) -> Result<String> {
+    Ok(create_refresh_token_with_metadata(did, key_bytes)?.token)
+}
+
+pub fn create_access_token_with_metadata(did: &Did, key_bytes: &[u8]) -> Result<TokenWithMetadata> {
+    create_access_token_with_scope_metadata(did, key_bytes, None, None)
+}
+
+pub fn create_access_token_with_scope_metadata(
+    did: &Did,
+    key_bytes: &[u8],
+    scopes: Option<&str>,
+    hostname: Option<&str>,
+) -> Result<TokenWithMetadata> {
+    let scope = scopes.unwrap_or(TokenScope::Access.as_str());
+    create_signed_token_with_metadata(
+        did,
+        scope,
+        TokenType::Access,
+        key_bytes,
+        Duration::minutes(120),
+        hostname,
+    )
+}
+
+pub fn create_access_token_with_delegation(
+    did: &Did,
+    key_bytes: &[u8],
+    scopes: Option<&str>,
+    controller_did: Option<&Did>,
+    hostname: Option<&str>,
+) -> Result<TokenWithMetadata> {
+    let scope = scopes.unwrap_or(TokenScope::Access.as_str());
+    let act = controller_did.map(|c| ActClaim { sub: c.clone() });
+    create_signed_token_with_act(
+        did,
+        scope,
+        TokenType::Access,
+        key_bytes,
+        Duration::minutes(120),
+        act,
+        hostname,
+    )
+}
+
+pub fn create_refresh_token_with_metadata(
+    did: &Did,
+    key_bytes: &[u8],
+) -> Result<TokenWithMetadata> {
+    create_signed_token_with_metadata(
+        did,
+        TokenScope::Refresh.as_str(),
+        TokenType::Refresh,
+        key_bytes,
+        Duration::days(90),
+        None,
+    )
+}
+
+/// Re-mint an access token carrying a specific `jti` and expiry. Used by the
+/// refresh grace window to reproduce a session's current access token without
+/// persisting the signed JWT itself.
+pub fn create_access_token_with_jti(
+    did: &Did,
+    key_bytes: &[u8],
+    scopes: Option<&str>,
+    controller_did: Option<&Did>,
+    hostname: Option<&str>,
+    jti: &Jti,
+    expires_at: DateTime<Utc>,
+) -> Result<String> {
+    let scope = scopes.unwrap_or(TokenScope::Access.as_str());
+    let act = controller_did.map(|c| ActClaim { sub: c.clone() });
+    Ok(create_signed_token_pinned(
+        did,
+        scope,
+        TokenType::Access,
+        key_bytes,
+        expires_at,
+        jti.clone(),
+        act,
+        hostname,
+    )?
+    .token)
+}
+
+/// Re-mint a refresh token carrying a specific `jti` and expiry. Counterpart to
+/// [`create_access_token_with_jti`] for the refresh grace window.
+pub fn create_refresh_token_with_jti(
+    did: &Did,
+    key_bytes: &[u8],
+    jti: &Jti,
+    expires_at: DateTime<Utc>,
+) -> Result<String> {
+    Ok(create_signed_token_pinned(
+        did,
+        TokenScope::Refresh.as_str(),
+        TokenType::Refresh,
+        key_bytes,
+        expires_at,
+        jti.clone(),
+        None,
+        None,
+    )?
+    .token)
+}
+
+pub fn create_service_token(
+    did: &Did,
+    aud: &Did,
+    lxm: Option<&Nsid>,
+    key_bytes: &[u8],
+) -> Result<String> {
+    let signing_key = SigningKey::from_slice(key_bytes)?;
+
+    let expiration = Utc::now()
+        .checked_add_signed(Duration::seconds(60))
+        .expect("valid timestamp")
+        .timestamp();
+
+    let claims = Claims {
+        iss: did.clone(),
+        sub: did.clone(),
+        aud: aud.to_string(),
+        exp: expiration,
+        iat: Utc::now().timestamp(),
+        scope: None,
+        lxm: lxm.cloned(),
+        jti: Jti::new(uuid::Uuid::new_v4().to_string()),
+        act: None,
+    };
+
+    sign_claims(claims, &signing_key)
+}
+
+fn create_signed_token_with_metadata(
+    did: &Did,
+    scope: &str,
+    typ: TokenType,
+    key_bytes: &[u8],
+    duration: Duration,
+    hostname: Option<&str>,
+) -> Result<TokenWithMetadata> {
+    create_signed_token_with_act(did, scope, typ, key_bytes, duration, None, hostname)
+}
+
+fn create_signed_token_with_act(
+    did: &Did,
+    scope: &str,
+    typ: TokenType,
+    key_bytes: &[u8],
+    duration: Duration,
+    act: Option<ActClaim>,
+    hostname: Option<&str>,
+) -> Result<TokenWithMetadata> {
+    let expires_at = Utc::now()
+        .checked_add_signed(duration)
+        .expect("valid timestamp");
+    let jti = Jti::new(uuid::Uuid::new_v4().to_string());
+    create_signed_token_pinned(did, scope, typ, key_bytes, expires_at, jti, act, hostname)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_signed_token_pinned(
+    did: &Did,
+    scope: &str,
+    typ: TokenType,
+    key_bytes: &[u8],
+    expires_at: DateTime<Utc>,
+    jti: Jti,
+    act: Option<ActClaim>,
+    hostname: Option<&str>,
+) -> Result<TokenWithMetadata> {
+    let signing_key = SigningKey::from_slice(key_bytes)?;
+
+    let expiration = expires_at.timestamp();
+
+    let aud_hostname = hostname.map(|h| h.to_string()).unwrap_or_else(|| {
+        tranquil_config::try_get()
+            .map(|c| c.server.hostname.clone())
+            .unwrap_or_else(|| "localhost".to_string())
+    });
+
+    let claims = Claims {
+        iss: did.clone(),
+        sub: did.clone(),
+        aud: format!("did:web:{}", aud_hostname),
+        exp: expiration,
+        iat: Utc::now().timestamp(),
+        scope: Some(scope.to_string()),
+        lxm: None,
+        jti: jti.clone(),
+        act,
+    };
+
+    let token = sign_claims_with_type(claims, &signing_key, typ)?;
+
+    Ok(TokenWithMetadata {
+        token,
+        jti,
+        expires_at,
+    })
+}
+
+fn sign_claims(claims: Claims, key: &SigningKey) -> Result<String> {
+    sign_claims_with_type(claims, key, TokenType::Service)
+}
+
+fn sign_claims_with_type(claims: Claims, key: &SigningKey, typ: TokenType) -> Result<String> {
+    let header = Header {
+        alg: SigningAlgorithm::ES256K,
+        typ,
+    };
+
+    let header_json = serde_json::to_string(&header)?;
+    let claims_json = serde_json::to_string(&claims)?;
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(header_json);
+    let claims_b64 = URL_SAFE_NO_PAD.encode(claims_json);
+
+    let message = format!("{}.{}", header_b64, claims_b64);
+    let signature: Signature = key.sign(message.as_bytes());
+    let signature_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+    Ok(format!("{}.{}", message, signature_b64))
+}
+
+pub fn create_access_token_hs256(did: &Did, secret: &[u8]) -> Result<String> {
+    Ok(create_access_token_hs256_with_metadata(did, secret)?.token)
+}
+
+pub fn create_refresh_token_hs256(did: &Did, secret: &[u8]) -> Result<String> {
+    Ok(create_refresh_token_hs256_with_metadata(did, secret)?.token)
+}
+
+pub fn create_access_token_hs256_with_metadata(
+    did: &Did,
+    secret: &[u8],
+) -> Result<TokenWithMetadata> {
+    create_hs256_token_with_metadata(
+        did,
+        TokenScope::Access.as_str(),
+        TokenType::Access,
+        secret,
+        Duration::minutes(120),
+    )
+}
+
+pub fn create_refresh_token_hs256_with_metadata(
+    did: &Did,
+    secret: &[u8],
+) -> Result<TokenWithMetadata> {
+    create_hs256_token_with_metadata(
+        did,
+        TokenScope::Refresh.as_str(),
+        TokenType::Refresh,
+        secret,
+        Duration::days(90),
+    )
+}
+
+pub fn create_service_token_hs256(
+    did: &Did,
+    aud: &Did,
+    lxm: &Nsid,
+    secret: &[u8],
+) -> Result<String> {
+    let expiration = Utc::now()
+        .checked_add_signed(Duration::seconds(60))
+        .expect("valid timestamp")
+        .timestamp();
+
+    let claims = Claims {
+        iss: did.clone(),
+        sub: did.clone(),
+        aud: aud.to_string(),
+        exp: expiration,
+        iat: Utc::now().timestamp(),
+        scope: None,
+        lxm: Some(lxm.clone()),
+        jti: Jti::new(uuid::Uuid::new_v4().to_string()),
+        act: None,
+    };
+
+    sign_claims_hs256(claims, TokenType::Service, secret)
+}
+
+fn create_hs256_token_with_metadata(
+    did: &Did,
+    scope: &str,
+    typ: TokenType,
+    secret: &[u8],
+    duration: Duration,
+) -> Result<TokenWithMetadata> {
+    let expires_at = Utc::now()
+        .checked_add_signed(duration)
+        .expect("valid timestamp");
+
+    let expiration = expires_at.timestamp();
+    let jti = Jti::new(uuid::Uuid::new_v4().to_string());
+
+    let claims = Claims {
+        iss: did.clone(),
+        sub: did.clone(),
+        aud: format!(
+            "did:web:{}",
+            tranquil_config::try_get()
+                .map(|c| c.server.hostname.clone())
+                .unwrap_or_else(|| "localhost".to_string())
+        ),
+        exp: expiration,
+        iat: Utc::now().timestamp(),
+        scope: Some(scope.to_string()),
+        lxm: None,
+        jti: jti.clone(),
+        act: None,
+    };
+
+    let token = sign_claims_hs256(claims, typ, secret)?;
+
+    Ok(TokenWithMetadata {
+        token,
+        jti,
+        expires_at,
+    })
+}
+
+fn sign_claims_hs256(claims: Claims, typ: TokenType, secret: &[u8]) -> Result<String> {
+    let header = Header {
+        alg: SigningAlgorithm::HS256,
+        typ,
+    };
+
+    let header_json = serde_json::to_string(&header)?;
+    let claims_json = serde_json::to_string(&claims)?;
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(header_json);
+    let claims_b64 = URL_SAFE_NO_PAD.encode(claims_json);
+
+    let message = format!("{}.{}", header_b64, claims_b64);
+
+    let mut mac = HmacSha256::new_from_slice(secret)
+        .map_err(|e| anyhow::anyhow!("Invalid secret length: {}", e))?;
+    mac.update(message.as_bytes());
+
+    let signature = mac.finalize().into_bytes();
+    let signature_b64 = URL_SAFE_NO_PAD.encode(signature);
+
+    Ok(format!("{}.{}", message, signature_b64))
+}

@@ -1,0 +1,13 @@
+node_modules/
+.pnpm-store/
+dist/
+dist-types/
+.dev.vars
+.dev.vars.*
+.env
+.env.local
+.wrangler/
+playwright-report/
+test-results/
+coverage/
+*.tsbuildinfo

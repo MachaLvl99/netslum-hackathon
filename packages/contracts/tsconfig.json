@@ -1,0 +1,5 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "composite": true, "outDir": "dist", "rootDir": "." },
+  "include": ["src/**/*.ts", "generated/util.ts", "generated/lexicons.ts", "generated/types/**/*.ts"]
+}

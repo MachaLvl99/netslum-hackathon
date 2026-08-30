@@ -1,0 +1,6 @@
+[Pod]
+PodName=tranquil-pds
+PublishPort=80:80
+PublishPort=443:443
+[Install]
+WantedBy=default.target

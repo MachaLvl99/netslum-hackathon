@@ -1,0 +1,727 @@
+use crate::auth::webauthn::WebAuthnConfig;
+use crate::cache::{Cache, DistributedRateLimiter, create_cache};
+use crate::circuit_breaker::CircuitBreakers;
+use crate::config::AuthConfig;
+use crate::did::DidResolver;
+use crate::oauth::client::CrossPdsOAuthClient;
+use crate::plc::PlcClient;
+use crate::rate_limit::RateLimiters;
+use crate::repo::PostgresBlockStore;
+use crate::repo_write_lock::RepoWriteLocks;
+use crate::sso::{SsoConfig, SsoManager};
+use crate::storage::{BlobStorage, create_blob_storage};
+use sqlx::PgPool;
+use std::error::Error;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+use tranquil_db::PostgresRepositories;
+use tranquil_db_traits::SequencedEvent;
+
+static RATE_LIMITING_DISABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn init_rate_limit_override() {
+    let disabled = tranquil_config::get().server.disable_rate_limiting;
+    RATE_LIMITING_DISABLED.store(disabled, Ordering::Relaxed);
+    if disabled {
+        tracing::warn!("rate limiting is DISABLED via configuration");
+    }
+}
+
+pub fn set_rate_limiting_disabled(disabled: bool) {
+    RATE_LIMITING_DISABLED.store(disabled, Ordering::Relaxed);
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub repos: Arc<PostgresRepositories>,
+    pub block_store: crate::repo::AnyBlockStore,
+    pub blob_store: Arc<dyn BlobStorage>,
+    pub firehose_tx: broadcast::Sender<SequencedEvent>,
+    pub rate_limiters: Arc<RateLimiters>,
+    pub repo_write_locks: Arc<RepoWriteLocks>,
+    pub circuit_breakers: Arc<CircuitBreakers>,
+    pub cache: Arc<dyn Cache>,
+    pub distributed_rate_limiter: Arc<dyn DistributedRateLimiter>,
+    pub did_resolver: Arc<DidResolver>,
+    pub sso_manager: SsoManager,
+    pub webauthn_config: Arc<WebAuthnConfig>,
+    pub cross_pds_oauth: Arc<CrossPdsOAuthClient>,
+    pub shutdown: CancellationToken,
+    pub bootstrap_invite_code: Option<crate::types::InviteCode>,
+    pub signal_sender: Option<Arc<tranquil_signal::SignalSlot>>,
+    pub signal_store_provider: Option<Arc<dyn tranquil_signal::SignalStoreProvider>>,
+    pub eventlog_segments_dir: Option<PathBuf>,
+    pub repo_export_semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitParams {
+    pub limit: u32,
+    pub window_ms: u64,
+}
+
+impl RateLimitParams {
+    pub fn to_governor_quota(self) -> governor::Quota {
+        use std::num::NonZeroU32;
+        let burst = NonZeroU32::new(self.limit).unwrap_or(NonZeroU32::MIN);
+        let period = std::time::Duration::from_millis(self.window_ms);
+        governor::Quota::with_period(period)
+            .expect("rate limit window must be non-zero")
+            .allow_burst(burst)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RateLimitKind {
+    Login,
+    AccountCreation,
+    PasswordReset,
+    ResetPassword,
+    RefreshSession,
+    OAuthToken,
+    OAuthAuthorize,
+    OAuthPar,
+    OAuthIntrospect,
+    AppPassword,
+    EmailUpdate,
+    TotpVerify,
+    HandleUpdate,
+    HandleUpdateDaily,
+    VerificationCheck,
+    SsoInitiate,
+    SsoCallback,
+    SsoUnlink,
+    OAuthRegisterComplete,
+    HandleVerification,
+}
+
+impl RateLimitKind {
+    const fn key_prefix(&self) -> &'static str {
+        match self {
+            Self::Login => "login",
+            Self::AccountCreation => "account_creation",
+            Self::PasswordReset => "password_reset",
+            Self::ResetPassword => "reset_password",
+            Self::RefreshSession => "refresh_session",
+            Self::OAuthToken => "oauth_token",
+            Self::OAuthAuthorize => "oauth_authorize",
+            Self::OAuthPar => "oauth_par",
+            Self::OAuthIntrospect => "oauth_introspect",
+            Self::AppPassword => "app_password",
+            Self::EmailUpdate => "email_update",
+            Self::TotpVerify => "totp_verify",
+            Self::HandleUpdate => "handle_update",
+            Self::HandleUpdateDaily => "handle_update_daily",
+            Self::VerificationCheck => "verification_check",
+            Self::SsoInitiate => "sso_initiate",
+            Self::SsoCallback => "sso_callback",
+            Self::SsoUnlink => "sso_unlink",
+            Self::OAuthRegisterComplete => "oauth_register_complete",
+            Self::HandleVerification => "handle_verification",
+        }
+    }
+
+    pub const fn params(&self) -> RateLimitParams {
+        match self {
+            Self::Login => RateLimitParams {
+                limit: 10,
+                window_ms: 60_000,
+            },
+            Self::AccountCreation => RateLimitParams {
+                limit: 10,
+                window_ms: 3_600_000,
+            },
+            Self::PasswordReset => RateLimitParams {
+                limit: 5,
+                window_ms: 3_600_000,
+            },
+            Self::ResetPassword => RateLimitParams {
+                limit: 10,
+                window_ms: 60_000,
+            },
+            Self::RefreshSession => RateLimitParams {
+                limit: 60,
+                window_ms: 60_000,
+            },
+            Self::OAuthToken => RateLimitParams {
+                limit: 300,
+                window_ms: 60_000,
+            },
+            Self::OAuthAuthorize => RateLimitParams {
+                limit: 10,
+                window_ms: 60_000,
+            },
+            Self::OAuthPar => RateLimitParams {
+                limit: 30,
+                window_ms: 60_000,
+            },
+            Self::OAuthIntrospect => RateLimitParams {
+                limit: 30,
+                window_ms: 60_000,
+            },
+            Self::AppPassword => RateLimitParams {
+                limit: 10,
+                window_ms: 60_000,
+            },
+            Self::EmailUpdate => RateLimitParams {
+                limit: 5,
+                window_ms: 3_600_000,
+            },
+            Self::TotpVerify => RateLimitParams {
+                limit: 5,
+                window_ms: 300_000,
+            },
+            Self::HandleUpdate => RateLimitParams {
+                limit: 10,
+                window_ms: 300_000,
+            },
+            Self::HandleUpdateDaily => RateLimitParams {
+                limit: 50,
+                window_ms: 86_400_000,
+            },
+            Self::VerificationCheck => RateLimitParams {
+                limit: 60,
+                window_ms: 60_000,
+            },
+            Self::SsoInitiate => RateLimitParams {
+                limit: 10,
+                window_ms: 60_000,
+            },
+            Self::SsoCallback => RateLimitParams {
+                limit: 30,
+                window_ms: 60_000,
+            },
+            Self::SsoUnlink => RateLimitParams {
+                limit: 10,
+                window_ms: 60_000,
+            },
+            Self::OAuthRegisterComplete => RateLimitParams {
+                limit: 5,
+                window_ms: 300_000,
+            },
+            Self::HandleVerification => RateLimitParams {
+                limit: 10,
+                window_ms: 60_000,
+            },
+        }
+    }
+}
+
+impl AppState {
+    pub fn plc_client(&self) -> PlcClient {
+        PlcClient::with_cache(None, Some(self.cache.clone()))
+    }
+
+    pub async fn new(shutdown: CancellationToken) -> Result<Self, Box<dyn Error>> {
+        let cfg = tranquil_config::get();
+
+        let mut state = match cfg.storage.repo_backend() {
+            tranquil_config::RepoBackend::TranquilStore => {
+                tracing::info!("tranquil-store repo backend active. EXPERIMENTAL!");
+                Self::from_store(shutdown).await
+            }
+            tranquil_config::RepoBackend::Postgres => {
+                let database_url = &cfg.database.url;
+                let max_connections = cfg.database.max_connections;
+                let min_connections = cfg.database.min_connections;
+                let acquire_timeout_secs = cfg.database.acquire_timeout_secs;
+
+                tracing::info!(
+                    "Configuring database pool: max={}, min={}, acquire_timeout={}s",
+                    max_connections,
+                    min_connections,
+                    acquire_timeout_secs
+                );
+
+                let db = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(max_connections)
+                    .min_connections(min_connections)
+                    .acquire_timeout(std::time::Duration::from_secs(acquire_timeout_secs))
+                    .idle_timeout(std::time::Duration::from_secs(300))
+                    .max_lifetime(std::time::Duration::from_secs(1800))
+                    .connect(database_url)
+                    .await
+                    .map_err(|e| format!("Failed to connect to Postgres: {}", e))?;
+
+                sqlx::migrate!("./migrations")
+                    .run(&db)
+                    .await
+                    .map_err(|e| format!("Failed to run migrations: {}", e))?;
+
+                Self::from_db(db, shutdown).await
+            }
+        };
+
+        if cfg.server.invite_code_required && state.repos.user.count_users().await.unwrap_or(1) == 0
+        {
+            let code = crate::util::gen_invite_code();
+            tracing::info!(
+                "No users exist and invite codes are required. Bootstrap invite code: {}",
+                code
+            );
+            state.bootstrap_invite_code = Some(code);
+        }
+
+        Ok(state)
+    }
+
+    pub async fn from_db(db: PgPool, shutdown: CancellationToken) -> Self {
+        let cfg = tranquil_config::get();
+        let (repos, block_store, signal_store_provider, eventlog_segments_dir): (
+            PostgresRepositories,
+            crate::repo::AnyBlockStore,
+            Option<Arc<dyn tranquil_signal::SignalStoreProvider>>,
+            Option<PathBuf>,
+        ) = match cfg.storage.repo_backend() == tranquil_config::RepoBackend::TranquilStore {
+            true => {
+                let wiring = wire_tranquil_store(&cfg.tranquil_store, shutdown.clone());
+                (
+                    wiring.repos,
+                    crate::repo::AnyBlockStore::TranquilStore(wiring.blockstore),
+                    Some(wiring.signal_provider),
+                    Some(wiring.segments_dir),
+                )
+            }
+            false => {
+                let repos = PostgresRepositories::new(db.clone());
+                let provider: Arc<dyn tranquil_signal::SignalStoreProvider> =
+                    Arc::new(tranquil_signal::PgSignalStoreProvider { pool: db.clone() });
+                (
+                    repos,
+                    crate::repo::AnyBlockStore::Postgres(PostgresBlockStore::new(db)),
+                    Some(provider),
+                    None,
+                )
+            }
+        };
+
+        Self::build(
+            repos,
+            block_store,
+            signal_store_provider,
+            eventlog_segments_dir,
+            shutdown,
+        )
+        .await
+    }
+
+    pub async fn from_store(shutdown: CancellationToken) -> Self {
+        let cfg = tranquil_config::get();
+        let wiring = wire_tranquil_store(&cfg.tranquil_store, shutdown.clone());
+
+        Self::build(
+            wiring.repos,
+            crate::repo::AnyBlockStore::TranquilStore(wiring.blockstore),
+            Some(wiring.signal_provider),
+            Some(wiring.segments_dir),
+            shutdown,
+        )
+        .await
+    }
+
+    pub async fn from_store_at(data_dir: &std::path::Path, shutdown: CancellationToken) -> Self {
+        let base = &tranquil_config::get().tranquil_store;
+        let store_cfg = tranquil_config::TranquilStoreConfig {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            memory_budget_mb: base.memory_budget_mb,
+            handler_threads: base.handler_threads,
+            eventlog_pending_bytes_budget: base.eventlog_pending_bytes_budget,
+            eventlog_max_event_payload: base.eventlog_max_event_payload,
+            max_blockstore_file_size: base.max_blockstore_file_size,
+            max_eventlog_segment_size: base.max_eventlog_segment_size,
+        };
+        let wiring = wire_tranquil_store(&store_cfg, shutdown.clone());
+
+        Self::build(
+            wiring.repos,
+            crate::repo::AnyBlockStore::TranquilStore(wiring.blockstore),
+            Some(wiring.signal_provider),
+            Some(wiring.segments_dir),
+            shutdown,
+        )
+        .await
+    }
+
+    async fn build(
+        repos: PostgresRepositories,
+        block_store: crate::repo::AnyBlockStore,
+        signal_store_provider: Option<Arc<dyn tranquil_signal::SignalStoreProvider>>,
+        eventlog_segments_dir: Option<PathBuf>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        AuthConfig::init();
+        init_rate_limit_override();
+
+        let cfg = tranquil_config::get();
+        let repos = Arc::new(repos);
+        let blob_store = create_blob_storage().await;
+        let firehose_buffer_size = cfg.firehose.buffer_size;
+        let (firehose_tx, _) = broadcast::channel(firehose_buffer_size);
+        let rate_limiters = Arc::new(RateLimiters::new());
+        let repo_write_locks = Arc::new(RepoWriteLocks::new());
+        let circuit_breakers = Arc::new(CircuitBreakers::new());
+        let (cache, distributed_rate_limiter) = create_cache(shutdown.clone())
+            .await
+            .expect("Failed to initialize cache and distributed rate limiter at startup");
+        let did_resolver = Arc::new(DidResolver::new());
+        let cross_pds_oauth = Arc::new(CrossPdsOAuthClient::new(cache.clone()));
+        let sso_config = SsoConfig::init();
+        let sso_manager = SsoManager::from_config(sso_config);
+        let webauthn_config = Arc::new(
+            WebAuthnConfig::new(&cfg.server.hostname)
+                .expect("Failed to create WebAuthn config at startup"),
+        );
+
+        Self {
+            repos,
+            block_store,
+            blob_store,
+            firehose_tx,
+            rate_limiters,
+            repo_write_locks,
+            circuit_breakers,
+            cache,
+            distributed_rate_limiter,
+            did_resolver,
+            cross_pds_oauth,
+            sso_manager,
+            webauthn_config,
+            shutdown,
+            bootstrap_invite_code: None,
+            signal_sender: None,
+            signal_store_provider,
+            eventlog_segments_dir,
+            repo_export_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                cfg.firehose.max_concurrent_repo_exports,
+            )),
+        }
+    }
+
+    pub fn with_rate_limiters(mut self, rate_limiters: RateLimiters) -> Self {
+        self.rate_limiters = Arc::new(rate_limiters);
+        self
+    }
+
+    pub fn with_cache(
+        mut self,
+        cache: Arc<dyn Cache>,
+        distributed_rate_limiter: Arc<dyn DistributedRateLimiter>,
+    ) -> Self {
+        self.cache = cache;
+        self.distributed_rate_limiter = distributed_rate_limiter;
+        self
+    }
+
+    pub fn with_signal_sender(mut self, slot: Arc<tranquil_signal::SignalSlot>) -> Self {
+        self.signal_sender = Some(slot);
+        self
+    }
+
+    pub fn with_circuit_breakers(mut self, circuit_breakers: CircuitBreakers) -> Self {
+        self.circuit_breakers = Arc::new(circuit_breakers);
+        self
+    }
+
+    pub async fn check_rate_limit(&self, kind: RateLimitKind, client_ip: &str) -> bool {
+        if RATE_LIMITING_DISABLED.load(Ordering::Relaxed) {
+            return true;
+        }
+
+        let limiter_name = kind.key_prefix();
+
+        let limiter = match kind {
+            RateLimitKind::Login => &self.rate_limiters.login,
+            RateLimitKind::AccountCreation => &self.rate_limiters.account_creation,
+            RateLimitKind::PasswordReset => &self.rate_limiters.password_reset,
+            RateLimitKind::ResetPassword => &self.rate_limiters.reset_password,
+            RateLimitKind::RefreshSession => &self.rate_limiters.refresh_session,
+            RateLimitKind::OAuthToken => &self.rate_limiters.oauth_token,
+            RateLimitKind::OAuthAuthorize => &self.rate_limiters.oauth_authorize,
+            RateLimitKind::OAuthPar => &self.rate_limiters.oauth_par,
+            RateLimitKind::OAuthIntrospect => &self.rate_limiters.oauth_introspect,
+            RateLimitKind::AppPassword => &self.rate_limiters.app_password,
+            RateLimitKind::EmailUpdate => &self.rate_limiters.email_update,
+            RateLimitKind::TotpVerify => &self.rate_limiters.totp_verify,
+            RateLimitKind::HandleUpdate => &self.rate_limiters.handle_update,
+            RateLimitKind::HandleUpdateDaily => &self.rate_limiters.handle_update_daily,
+            RateLimitKind::VerificationCheck => &self.rate_limiters.verification_check,
+            RateLimitKind::SsoInitiate => &self.rate_limiters.sso_initiate,
+            RateLimitKind::SsoCallback => &self.rate_limiters.sso_callback,
+            RateLimitKind::SsoUnlink => &self.rate_limiters.sso_unlink,
+            RateLimitKind::OAuthRegisterComplete => &self.rate_limiters.oauth_register_complete,
+            RateLimitKind::HandleVerification => &self.rate_limiters.handle_verification,
+        };
+
+        if limiter.check_key(&client_ip.to_string()).is_err() {
+            crate::metrics::record_rate_limit_rejection(limiter_name);
+            return false;
+        }
+
+        let key = format!("{}:{}", kind.key_prefix(), client_ip);
+        let params = kind.params();
+
+        if !self
+            .distributed_rate_limiter
+            .check_rate_limit(&key, params.limit, params.window_ms)
+            .await
+        {
+            crate::metrics::record_rate_limit_rejection(limiter_name);
+            return false;
+        }
+
+        true
+    }
+}
+
+struct TranquilStoreWiring {
+    blockstore: tranquil_store::blockstore::TranquilBlockStore<
+        tranquil_store::RealIO,
+        tranquil_store::SystemClock,
+    >,
+    signal_provider: Arc<dyn tranquil_signal::SignalStoreProvider>,
+    repos: PostgresRepositories,
+    segments_dir: PathBuf,
+}
+
+fn migrate_delegation_preset_scopes(metastore: &tranquil_store::metastore::Metastore) {
+    const MARKER_KEY: &str = "migration:delegation_preset_scopes_v1";
+    const LEGACY_EDITOR_SCOPES: &str =
+        "repo:*?action=create repo:*?action=update repo:*?action=delete blob:*/*";
+
+    let infra = metastore.infra_ops();
+    if infra.get_server_config(MARKER_KEY).ok().flatten().is_some() {
+        return;
+    }
+
+    let ops = metastore.delegation_ops();
+    let owners = match ops.remap_grant_scopes("atproto", crate::delegation::OWNER_FULL_SCOPES) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(error = ?e, "delegation owner-scope migration failed, will retry on next start");
+            return;
+        }
+    };
+    let editors = match ops
+        .remap_grant_scopes(LEGACY_EDITOR_SCOPES, crate::delegation::EDITOR_FULL_SCOPES)
+    {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(error = ?e, "delegation editor-scope migration failed, will retry on next start");
+            return;
+        }
+    };
+    if owners + editors > 0 {
+        tracing::info!(
+            owners,
+            editors,
+            "upgraded legacy delegation grants to preset scopes"
+        );
+    }
+
+    if let Err(e) = infra.upsert_server_config(MARKER_KEY, "done") {
+        tracing::error!(error = ?e, "failed to record delegation scope migration marker, will retry");
+    }
+}
+
+fn wire_tranquil_store(
+    store_cfg: &tranquil_config::TranquilStoreConfig,
+    shutdown: CancellationToken,
+) -> TranquilStoreWiring {
+    use tranquil_store::RealIO;
+    use tranquil_store::blockstore::{BlockStoreConfig, TranquilBlockStore};
+    use tranquil_store::eventlog::{EventLog, EventLogBridge, EventLogConfig};
+    use tranquil_store::metastore::client::MetastoreClient;
+    use tranquil_store::metastore::handler::HandlerPool;
+    use tranquil_store::metastore::partitions::Partition;
+    use tranquil_store::metastore::{Metastore, MetastoreConfig};
+
+    let base_dir = PathBuf::from(&store_cfg.data_dir);
+    let data_dir = match std::env::var("TRANQUIL_PDS_TEST_INFRA_READY").as_deref() {
+        Ok("1") => base_dir.join(format!("pid-{}", std::process::id())),
+        _ => base_dir,
+    };
+    let metastore_dir = data_dir.join("metastore");
+    let segments_dir = data_dir.join("eventlog").join("segments");
+    let blockstore_data_dir = data_dir.join("blockstore").join("data");
+    let blockstore_index_dir = data_dir.join("blockstore").join("index");
+
+    std::fs::create_dir_all(&metastore_dir).expect("failed to create metastore directory");
+    std::fs::create_dir_all(&segments_dir).expect("failed to create eventlog segments directory");
+    std::fs::create_dir_all(&blockstore_data_dir)
+        .expect("failed to create blockstore data directory");
+    std::fs::create_dir_all(&blockstore_index_dir)
+        .expect("failed to create blockstore index directory");
+
+    let metastore_config = store_cfg
+        .memory_budget_mb
+        .map(|mb| MetastoreConfig {
+            cache_size_bytes: mb.saturating_mul(1024 * 1024),
+        })
+        .unwrap_or_default();
+
+    let metastore =
+        Metastore::open(&metastore_dir, metastore_config).expect("failed to open metastore");
+
+    let blockstore = TranquilBlockStore::open_with_retry(
+        BlockStoreConfig {
+            data_dir: blockstore_data_dir,
+            index_dir: blockstore_index_dir,
+            max_file_size: store_cfg.max_blockstore_file_size,
+            group_commit: Default::default(),
+            shard_count: tranquil_store::blockstore::DEFAULT_SHARD_COUNT,
+        },
+        tranquil_store::blockstore::OpenRetryPolicy::default(),
+    )
+    .expect("failed to open blockstore");
+
+    let event_log = EventLog::open(
+        EventLogConfig {
+            segments_dir,
+            pending_bytes_budget: store_cfg.eventlog_pending_bytes_budget,
+            max_event_payload: store_cfg.eventlog_max_event_payload,
+            max_segment_size: store_cfg.max_eventlog_segment_size,
+            ..EventLogConfig::default()
+        },
+        RealIO::new(),
+    )
+    .expect("failed to open eventlog");
+    let event_log = Arc::new(event_log);
+
+    let bridge = Arc::new(EventLogBridge::new(Arc::clone(&event_log)));
+
+    let was_clean = tranquil_store::consistency::had_clean_shutdown(&data_dir);
+    tranquil_store::consistency::remove_clean_shutdown_marker(&data_dir)
+        .expect("failed to remove clean shutdown marker");
+
+    let indexes = metastore.partition(Partition::Indexes).clone();
+    let event_ops = metastore.event_ops(Arc::clone(&bridge));
+    let recovered = event_ops
+        .recover_metastore_mutations(&indexes)
+        .expect("metastore crash recovery failed");
+    if recovered > 0 {
+        tracing::info!(recovered, "replayed metastore mutations from eventlog");
+    }
+
+    let skip_check = std::env::var("TRANQUIL_SKIP_CONSISTENCY_CHECK").is_ok_and(|v| v == "1");
+    if (!was_clean || recovered > 0) && !skip_check {
+        let report = tranquil_store::consistency::verify_store_consistency(
+            &blockstore,
+            &metastore,
+            &event_log,
+        );
+        report.log_findings();
+
+        if report.has_repairable_issues() {
+            let repair = tranquil_store::consistency::repair_known_issues(&blockstore, &report);
+            if repair.orphan_files_removed > 0 {
+                tracing::info!(
+                    removed = repair.orphan_files_removed,
+                    "repaired orphan data files"
+                );
+            }
+            if repair.orphan_hints_removed > 0 {
+                tracing::info!(
+                    removed = repair.orphan_hints_removed,
+                    "repaired orphan hint files"
+                );
+            }
+            if repair.phantom_index_entries_purged > 0 {
+                tracing::info!(
+                    purged = repair.phantom_index_entries_purged,
+                    "purged phantom index entries pointing at missing data files"
+                );
+            }
+            if repair.had_errors() {
+                tracing::warn!(errors = repair.repair_errors, "some repairs failed");
+            }
+        }
+
+        if report.has_unrecoverable_issues() {
+            panic!(
+                "unrecoverable store inconsistencies detected: {} dangling root CIDs, {} dangling record CIDs, \
+                 {} deserialization failures, cursor_ahead={}. \
+                 manual intervention required. set TRANQUIL_SKIP_CONSISTENCY_CHECK=1 to bypass.",
+                report.dangling_root_cids.len(),
+                report.dangling_record_cids.len(),
+                report.deserialization_failures,
+                report.cursor_ahead_of_eventlog,
+            );
+        }
+    }
+
+    if std::env::var("TRANQUIL_PURGE_ORPHAN_REPOS").is_ok_and(|v| v == "1") {
+        match metastore
+            .repo_ops()
+            .purge_orphan_repos(metastore.database())
+        {
+            Ok(0) => tracing::info!("orphan repo purge: no orphans found"),
+            Ok(n) => tracing::info!(purged = n, "orphan repo purge: removed orphan repo_meta"),
+            Err(e) => tracing::error!(error = %e, "orphan repo purge failed"),
+        }
+    }
+
+    migrate_delegation_preset_scopes(&metastore);
+
+    let notifier = bridge.notifier();
+    let signal_db = metastore.database().clone();
+    let signal_ks = metastore.signal_keyspace();
+
+    let pool = Arc::new(HandlerPool::spawn::<RealIO>(
+        metastore,
+        bridge,
+        Some(blockstore.clone()),
+        store_cfg.handler_threads,
+    ));
+
+    tokio::spawn({
+        let pool = Arc::clone(&pool);
+        let shutdown_event_log = Arc::clone(&event_log);
+        let shutdown_data_dir = data_dir.clone();
+        async move {
+            shutdown.cancelled().await;
+            pool.close().await;
+            if let Err(e) = shutdown_event_log.shutdown() {
+                tracing::warn!(error = %e, "eventlog shutdown failed");
+            }
+            if let Err(e) =
+                tranquil_store::consistency::write_clean_shutdown_marker(&shutdown_data_dir)
+            {
+                tracing::warn!(error = %e, "failed to write clean shutdown marker");
+            }
+        }
+    });
+
+    let client = MetastoreClient::<RealIO>::new(pool, Arc::clone(&event_log));
+
+    tracing::info!(data_dir = %store_cfg.data_dir, "tranquil-store data directory");
+
+    let repos = PostgresRepositories {
+        pool: None,
+        repo: Arc::new(client.clone()),
+        backlink: Arc::new(client.clone()),
+        blob: Arc::new(client.clone()),
+        user: Arc::new(client.clone()),
+        session: Arc::new(client.clone()),
+        oauth: Arc::new(client.clone()),
+        infra: Arc::new(client.clone()),
+        delegation: Arc::new(client.clone()),
+        sso: Arc::new(client),
+        event_notifier: Arc::new(notifier),
+    };
+
+    let signal_provider: Arc<dyn tranquil_signal::SignalStoreProvider> = Arc::new(
+        tranquil_signal::fjall_store::FjallSignalStoreProvider::new(signal_db, signal_ks),
+    );
+
+    let eventlog_segments_dir = event_log.segments_dir().to_path_buf();
+
+    TranquilStoreWiring {
+        blockstore,
+        signal_provider,
+        repos,
+        segments_dir: eventlog_segments_dir,
+    }
+}

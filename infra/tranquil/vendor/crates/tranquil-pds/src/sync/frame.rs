@@ -1,0 +1,236 @@
+use crate::sync::firehose::SequencedEvent;
+use cid::Cid;
+use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+use tranquil_db_traits::SequenceNumber;
+use tranquil_scopes::RepoAction;
+use tranquil_types::{CidLink, Did, Handle, Tid};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrameType {
+    #[serde(rename = "#commit")]
+    Commit,
+    #[serde(rename = "#identity")]
+    Identity,
+    #[serde(rename = "#account")]
+    Account,
+    #[serde(rename = "#sync")]
+    Sync,
+    #[serde(rename = "#info")]
+    Info,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FrameHeader {
+    pub op: i64,
+    pub t: FrameType,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CommitFrame {
+    pub seq: SequenceNumber,
+    pub rebase: bool,
+    #[serde(rename = "tooBig")]
+    pub too_big: bool,
+    pub repo: Did,
+    pub commit: Cid,
+    pub rev: Tid,
+    pub since: Option<Tid>,
+    #[serde(with = "serde_bytes")]
+    pub blocks: Vec<u8>,
+    pub ops: Vec<RepoOp>,
+    pub blobs: Vec<Cid>,
+    pub time: String,
+    #[serde(rename = "prevData", skip_serializing_if = "Option::is_none")]
+    pub prev_data: Option<Cid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JsonRepoOp {
+    action: String,
+    path: String,
+    cid: Option<String>,
+    prev: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoOp {
+    pub action: RepoAction,
+    pub path: String,
+    pub cid: Option<Cid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev: Option<Cid>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IdentityFrame {
+    pub did: Did,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<Handle>,
+    pub seq: SequenceNumber,
+    pub time: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AccountFrame {
+    pub did: Did,
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<tranquil_db_traits::AccountStatus>,
+    pub seq: SequenceNumber,
+    pub time: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SyncFrame {
+    pub did: Did,
+    pub rev: Tid,
+    #[serde(with = "serde_bytes")]
+    pub blocks: Vec<u8>,
+    pub seq: SequenceNumber,
+    pub time: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum InfoFrameName {
+    #[serde(rename = "OutdatedCursor")]
+    OutdatedCursor,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum ErrorFrameName {
+    #[serde(rename = "FutureCursor")]
+    FutureCursor,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InfoFrame {
+    pub name: InfoFrameName,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ErrorFrameHeader {
+    pub op: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ErrorFrameBody {
+    pub error: ErrorFrameName,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CommitFrameError {
+    InvalidCommitCid(String),
+    InvalidBlobCid(String),
+}
+
+impl std::fmt::Display for CommitFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidCommitCid(s) => write!(f, "Invalid commit CID: {}", s),
+            Self::InvalidBlobCid(s) => write!(f, "Invalid blob CID: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for CommitFrameError {}
+
+pub struct CommitFrameBuilder {
+    seq: SequenceNumber,
+    did: Did,
+    commit_cid: Cid,
+    ops_json: serde_json::Value,
+    blob_cids: Vec<Cid>,
+    time: chrono::DateTime<chrono::Utc>,
+    rev: Option<Tid>,
+}
+
+impl CommitFrameBuilder {
+    pub fn new(
+        seq: SequenceNumber,
+        did: Did,
+        commit_cid: &CidLink,
+        ops_json: serde_json::Value,
+        blob_links: Vec<CidLink>,
+        time: chrono::DateTime<chrono::Utc>,
+        rev: Option<Tid>,
+    ) -> Result<Self, CommitFrameError> {
+        let commit_cid = commit_cid
+            .to_cid()
+            .ok_or_else(|| CommitFrameError::InvalidCommitCid(commit_cid.to_string()))?;
+        let blob_cids: Vec<Cid> = blob_links.iter().filter_map(|s| s.to_cid()).collect();
+        Ok(Self {
+            seq,
+            did,
+            commit_cid,
+            ops_json,
+            blob_cids,
+            time,
+            rev,
+        })
+    }
+
+    pub fn build(self) -> CommitFrame {
+        let json_ops: Vec<JsonRepoOp> =
+            serde_json::from_value(self.ops_json).unwrap_or_else(|_| vec![]);
+        let ops: Vec<RepoOp> = json_ops
+            .into_iter()
+            .filter_map(|op| {
+                Some(RepoOp {
+                    action: RepoAction::parse_str(&op.action)?,
+                    path: op.path,
+                    cid: op.cid.and_then(|s| Cid::from_str(&s).ok()),
+                    prev: op.prev.and_then(|s| Cid::from_str(&s).ok()),
+                })
+            })
+            .collect();
+        let rev = self.rev.unwrap_or_else(placeholder_rev);
+        let since = None;
+        CommitFrame {
+            seq: self.seq,
+            rebase: false,
+            too_big: false,
+            repo: self.did,
+            commit: self.commit_cid,
+            rev,
+            since,
+            blocks: Vec::new(),
+            ops,
+            blobs: self.blob_cids,
+            time: format_atproto_time(self.time),
+            prev_data: None,
+        }
+    }
+}
+
+fn placeholder_rev() -> Tid {
+    Tid::now()
+}
+
+fn format_atproto_time(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+impl TryFrom<SequencedEvent> for CommitFrame {
+    type Error = CommitFrameError;
+
+    fn try_from(event: SequencedEvent) -> Result<Self, Self::Error> {
+        let commit_cid = event.commit_cid.ok_or_else(|| {
+            CommitFrameError::InvalidCommitCid("Missing commit_cid in event".to_string())
+        })?;
+        let builder = CommitFrameBuilder::new(
+            event.seq,
+            event.did.clone(),
+            &commit_cid,
+            event.ops.unwrap_or_default(),
+            event.blobs.unwrap_or_default(),
+            event.created_at,
+            event.rev,
+        )?;
+        Ok(builder.build())
+    }
+}

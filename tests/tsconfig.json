@@ -1,0 +1,14 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "dist-types",
+    "types": ["vitest"]
+  },
+  "references": [
+    { "path": "../packages/contracts" },
+    { "path": "../packages/sandbox" },
+    { "path": "../workers/site-runtime" }
+  ],
+  "include": ["**/*.ts"]
+}

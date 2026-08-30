@@ -1,0 +1,35 @@
+{
+  "name": "netslum",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "packageManager": "pnpm@11.24.0",
+  "engines": { "node": ">=24 <25" },
+  "scripts": {
+    "setup:local": "node scripts/setup-local.mjs",
+    "dev": "node scripts/dev-all.mjs",
+    "dev:all": "node scripts/dev-all.mjs",
+    "dev:web": "pnpm --filter @netslum/web dev",
+    "dev:assets": "pnpm --filter @netslum/site-runtime dev:assets",
+    "dev:runtime": "pnpm --filter @netslum/site-runtime dev:runtime",
+    "dev:egress": "pnpm --filter @netslum/site-runtime dev:egress",
+    "build": "pnpm -r build",
+    "check": "pnpm lex:check && pnpm wrangler:types && tsc -b --pretty false && eslint .",
+    "lex:check": "pnpm --filter @netslum/contracts lex:check",
+    "wrangler:types": "pnpm --filter @netslum/web wrangler:types && pnpm --filter @netslum/site-runtime wrangler:types",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "deploy:web": "pnpm --filter @netslum/web deploy",
+    "deploy:runtime": "pnpm --filter @netslum/site-runtime deploy",
+    "db:migrate:local": "pnpm --filter @netslum/web db:migrate:local"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.2",
+    "@playwright/test": "1.62.1",
+    "@types/node": "24.10.9",
+    "eslint": "9.39.2",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.48.1",
+    "vitest": "4.1.11"
+  }
+}

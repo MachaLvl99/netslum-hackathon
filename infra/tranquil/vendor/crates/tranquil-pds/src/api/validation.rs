@@ -1,0 +1,561 @@
+use crate::types::Handle;
+use std::fmt;
+
+pub const MAX_EMAIL_LENGTH: usize = 254;
+pub const MAX_LOCAL_PART_LENGTH: usize = 64;
+pub const MAX_DOMAIN_LENGTH: usize = 253;
+pub const MAX_DOMAIN_LABEL_LENGTH: usize = 63;
+const EMAIL_LOCAL_SPECIAL_CHARS: &str = ".!#$%&'*+/=?^_`{|}~-";
+
+pub const MIN_HANDLE_LENGTH: usize = 3;
+pub const MAX_HANDLE_LENGTH: usize = 253;
+pub const MAX_SERVICE_HANDLE_LOCAL_PART: usize = 18;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmailValidationError {
+    Empty,
+    TooLong,
+    MissingAtSign,
+    EmptyLocalPart,
+    LocalPartTooLong,
+    InvalidLocalPart,
+    EmptyDomain,
+    DomainTooLong,
+    MissingDomainDot,
+    InvalidDomainLabel,
+}
+
+impl fmt::Display for EmailValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "Email cannot be empty"),
+            Self::TooLong => write!(
+                f,
+                "Email exceeds maximum length of {} characters",
+                MAX_EMAIL_LENGTH
+            ),
+            Self::MissingAtSign => write!(f, "Email must contain @"),
+            Self::EmptyLocalPart => write!(f, "Email local part cannot be empty"),
+            Self::LocalPartTooLong => write!(f, "Email local part exceeds maximum length"),
+            Self::InvalidLocalPart => write!(f, "Email local part contains invalid characters"),
+            Self::EmptyDomain => write!(f, "Email domain cannot be empty"),
+            Self::DomainTooLong => write!(f, "Email domain exceeds maximum length"),
+            Self::MissingDomainDot => write!(f, "Email domain must contain a dot"),
+            Self::InvalidDomainLabel => write!(f, "Email domain contains invalid label"),
+        }
+    }
+}
+
+impl std::error::Error for EmailValidationError {}
+
+fn validate_email_detailed(email: &str) -> Result<(), EmailValidationError> {
+    if email.is_empty() {
+        return Err(EmailValidationError::Empty);
+    }
+    if email.len() > MAX_EMAIL_LENGTH {
+        return Err(EmailValidationError::TooLong);
+    }
+    let parts: Vec<&str> = email.rsplitn(2, '@').collect();
+    if parts.len() != 2 {
+        return Err(EmailValidationError::MissingAtSign);
+    }
+    let domain = parts[0];
+    let local = parts[1];
+    if local.is_empty() {
+        return Err(EmailValidationError::EmptyLocalPart);
+    }
+    if local.len() > MAX_LOCAL_PART_LENGTH {
+        return Err(EmailValidationError::LocalPartTooLong);
+    }
+    if local.starts_with('.') || local.ends_with('.') || local.contains("..") {
+        return Err(EmailValidationError::InvalidLocalPart);
+    }
+    if !local
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || EMAIL_LOCAL_SPECIAL_CHARS.contains(c))
+    {
+        return Err(EmailValidationError::InvalidLocalPart);
+    }
+    if domain.is_empty() {
+        return Err(EmailValidationError::EmptyDomain);
+    }
+    if domain.len() > MAX_DOMAIN_LENGTH {
+        return Err(EmailValidationError::DomainTooLong);
+    }
+    if !domain.contains('.') {
+        return Err(EmailValidationError::MissingDomainDot);
+    }
+    if !domain.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= MAX_DOMAIN_LABEL_LENGTH
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    }) {
+        return Err(EmailValidationError::InvalidDomainLabel);
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+pub enum HandleValidationError {
+    Empty,
+    TooShort,
+    TooLong { max: usize },
+    InvalidCharacters,
+    StartsWithInvalidChar,
+    EndsWithInvalidChar,
+    ContainsSpaces,
+    BannedWord,
+    Reserved,
+    InvalidSyntax,
+    DisallowedTld,
+    UnusableHandleDomain,
+    NoHandleDomains,
+}
+
+impl std::fmt::Display for HandleValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "Handle cannot be empty"),
+            Self::TooShort => write!(
+                f,
+                "Handle must be at least {} characters",
+                MIN_HANDLE_LENGTH
+            ),
+            Self::TooLong { max } => {
+                write!(f, "Handle exceeds maximum length of {} characters", max)
+            }
+            Self::InvalidCharacters => write!(
+                f,
+                "Handle contains invalid characters. Only alphanumeric characters and hyphens are allowed"
+            ),
+            Self::StartsWithInvalidChar => {
+                write!(f, "Handle cannot start with a hyphen")
+            }
+            Self::EndsWithInvalidChar => write!(f, "Handle cannot end with a hyphen"),
+            Self::ContainsSpaces => write!(f, "Handle cannot contain spaces"),
+            Self::BannedWord => write!(f, "Inappropriate language in handle"),
+            Self::Reserved => write!(f, "Reserved handle"),
+            Self::InvalidSyntax => write!(f, "Handle does not match atproto handle syntax"),
+            Self::DisallowedTld => write!(f, "Handle uses a reserved TLD and cannot resolve"),
+            Self::UnusableHandleDomain => write!(
+                f,
+                "This server's handle domain has a reserved TLD, so no handle under it is a valid atproto handle"
+            ),
+            Self::NoHandleDomains => {
+                write!(f, "No handle domains are configured on this server")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HandleValidationError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedHandlePolicy {
+    Allow,
+    Reject,
+}
+
+pub fn validate_full_domain_handle(handle: &str) -> Result<Handle, HandleValidationError> {
+    let handle = handle.trim();
+
+    if handle.is_empty() {
+        return Err(HandleValidationError::Empty);
+    }
+
+    if handle.contains(' ') || handle.contains('\t') || handle.contains('\n') {
+        return Err(HandleValidationError::ContainsSpaces);
+    }
+
+    if handle.len() > MAX_HANDLE_LENGTH {
+        return Err(HandleValidationError::TooLong {
+            max: MAX_HANDLE_LENGTH,
+        });
+    }
+
+    if handle
+        .chars()
+        .any(|c| !c.is_ascii_alphanumeric() && c != '.' && c != '-')
+    {
+        return Err(HandleValidationError::InvalidCharacters);
+    }
+
+    if !handle.contains('.') {
+        return Err(HandleValidationError::InvalidCharacters);
+    }
+
+    let labels: Vec<&str> = handle.split('.').collect();
+    let has_invalid_label = labels.iter().any(|label| {
+        label.is_empty()
+            || label.len() > MAX_DOMAIN_LABEL_LENGTH
+            || label.starts_with('-')
+            || label.ends_with('-')
+    });
+    if has_invalid_label {
+        return Err(HandleValidationError::InvalidCharacters);
+    }
+
+    let handle_lower = handle.to_lowercase();
+
+    if crate::moderation::has_explicit_slur(&handle_lower) {
+        return Err(HandleValidationError::BannedWord);
+    }
+
+    let handle = Handle::new(handle_lower).map_err(|_| HandleValidationError::InvalidSyntax)?;
+    match handle.has_disallowed_tld() {
+        true => Err(HandleValidationError::DisallowedTld),
+        false => Ok(handle),
+    }
+}
+
+pub fn validate_short_handle(handle: &str) -> Result<String, HandleValidationError> {
+    validate_service_handle(handle, ReservedHandlePolicy::Reject)
+}
+
+pub fn resolve_handle_input(input: &str) -> Result<Handle, HandleValidationError> {
+    let available_domains = tranquil_config::get().server.available_user_domain_list();
+    let matched_domain = available_domains
+        .iter()
+        .filter(|d| input.ends_with(&format!(".{}", d)))
+        .max_by_key(|d| d.len());
+
+    if !input.contains('.') || matched_domain.is_some() {
+        let handle_to_validate = match matched_domain {
+            Some(domain) => input.strip_suffix(&format!(".{}", domain)).unwrap_or(input),
+            None => input,
+        };
+        let validated = validate_short_handle(handle_to_validate)?;
+        let domain = matched_domain
+            .or_else(|| available_domains.first())
+            .ok_or(HandleValidationError::NoHandleDomains)?;
+        let handle = Handle::new(format!("{}.{}", validated, domain))
+            .map_err(|_| HandleValidationError::InvalidSyntax)?;
+        match handle.has_disallowed_tld() {
+            true => Err(HandleValidationError::UnusableHandleDomain),
+            false => Ok(handle),
+        }
+    } else {
+        validate_full_domain_handle(input)
+    }
+}
+
+pub fn domain_forms_valid_handles(domain: &str) -> bool {
+    Handle::new(format!("whelk.{domain}")).is_ok_and(|h| !h.has_disallowed_tld())
+}
+
+pub fn warn_unusable_handle_domains() {
+    tranquil_config::get()
+        .server
+        .user_handle_domain_list()
+        .iter()
+        .filter(|domain| !domain_forms_valid_handles(domain))
+        .for_each(|domain| {
+            tracing::error!(
+                domain = %domain,
+                "configured handle domain can't form a valid atproto handle, so every account \
+                 creation under it will be rejected. Set server.user_handle_domains to a domain \
+                 whose TLD isn't reserved."
+            );
+        });
+}
+
+pub fn validate_service_handle(
+    handle: &str,
+    reserved_policy: ReservedHandlePolicy,
+) -> Result<String, HandleValidationError> {
+    let handle = handle.trim();
+
+    if handle.is_empty() {
+        return Err(HandleValidationError::Empty);
+    }
+
+    if handle.contains(' ') || handle.contains('\t') || handle.contains('\n') {
+        return Err(HandleValidationError::ContainsSpaces);
+    }
+
+    if handle.len() < MIN_HANDLE_LENGTH {
+        return Err(HandleValidationError::TooShort);
+    }
+
+    if handle.len() > MAX_SERVICE_HANDLE_LOCAL_PART {
+        return Err(HandleValidationError::TooLong {
+            max: MAX_SERVICE_HANDLE_LOCAL_PART,
+        });
+    }
+
+    if let Some(first_char) = handle.chars().next()
+        && first_char == '-'
+    {
+        return Err(HandleValidationError::StartsWithInvalidChar);
+    }
+
+    if let Some(last_char) = handle.chars().last()
+        && last_char == '-'
+    {
+        return Err(HandleValidationError::EndsWithInvalidChar);
+    }
+
+    if !handle
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(HandleValidationError::InvalidCharacters);
+    }
+
+    if crate::moderation::has_explicit_slur(handle) {
+        return Err(HandleValidationError::BannedWord);
+    }
+
+    if reserved_policy == ReservedHandlePolicy::Reject
+        && crate::handle::reserved::is_reserved_subdomain(handle)
+    {
+        return Err(HandleValidationError::Reserved);
+    }
+
+    Ok(handle.to_lowercase())
+}
+
+pub fn is_valid_email(email: &str) -> bool {
+    validate_email_detailed(email.trim()).is_ok()
+}
+
+pub fn is_valid_telegram_username(username: &str) -> bool {
+    let clean = username.strip_prefix('@').unwrap_or(username);
+    (5..=32).contains(&clean.len()) && clean.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+pub fn is_valid_discord_username(username: &str) -> bool {
+    (2..=32).contains(&username.len())
+        && username
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
+        && !username.contains("..")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_handles() {
+        assert_eq!(validate_short_handle("alice"), Ok("alice".to_string()));
+        assert_eq!(validate_short_handle("bob123"), Ok("bob123".to_string()));
+        assert_eq!(
+            validate_short_handle("user-name"),
+            Ok("user-name".to_string())
+        );
+        assert_eq!(
+            validate_short_handle("UPPERCASE"),
+            Ok("uppercase".to_string())
+        );
+        assert_eq!(
+            validate_short_handle("MixedCase123"),
+            Ok("mixedcase123".to_string())
+        );
+        assert_eq!(validate_short_handle("abc"), Ok("abc".to_string()));
+    }
+
+    #[test]
+    fn full_domain_handles_with_reserved_tlds_are_rejected() {
+        assert!(validate_full_domain_handle("whelk.oyster.cafe").is_ok());
+        assert_eq!(
+            validate_full_domain_handle("whelk.pds.internal"),
+            Err(HandleValidationError::DisallowedTld)
+        );
+        assert_eq!(
+            validate_full_domain_handle("handle.invalid"),
+            Err(HandleValidationError::DisallowedTld)
+        );
+    }
+
+    #[test]
+    fn test_invalid_handles() {
+        assert_eq!(validate_short_handle(""), Err(HandleValidationError::Empty));
+        assert_eq!(
+            validate_short_handle("   "),
+            Err(HandleValidationError::Empty)
+        );
+        assert_eq!(
+            validate_short_handle("ab"),
+            Err(HandleValidationError::TooShort)
+        );
+        assert_eq!(
+            validate_short_handle("a"),
+            Err(HandleValidationError::TooShort)
+        );
+        assert_eq!(
+            validate_short_handle("test spaces"),
+            Err(HandleValidationError::ContainsSpaces)
+        );
+        assert_eq!(
+            validate_short_handle("test\ttab"),
+            Err(HandleValidationError::ContainsSpaces)
+        );
+        assert_eq!(
+            validate_short_handle("-starts"),
+            Err(HandleValidationError::StartsWithInvalidChar)
+        );
+        assert_eq!(
+            validate_short_handle("_starts"),
+            Err(HandleValidationError::InvalidCharacters)
+        );
+        assert_eq!(
+            validate_short_handle("ends-"),
+            Err(HandleValidationError::EndsWithInvalidChar)
+        );
+        assert_eq!(
+            validate_short_handle("ends_"),
+            Err(HandleValidationError::InvalidCharacters)
+        );
+        assert_eq!(
+            validate_short_handle("user_name"),
+            Err(HandleValidationError::InvalidCharacters)
+        );
+        assert_eq!(
+            validate_short_handle("test@user"),
+            Err(HandleValidationError::InvalidCharacters)
+        );
+        assert_eq!(
+            validate_short_handle("test!user"),
+            Err(HandleValidationError::InvalidCharacters)
+        );
+        assert_eq!(
+            validate_short_handle("test.user"),
+            Err(HandleValidationError::InvalidCharacters)
+        );
+    }
+
+    #[test]
+    fn test_handle_trimming() {
+        assert_eq!(validate_short_handle("  alice  "), Ok("alice".to_string()));
+    }
+
+    #[test]
+    fn test_handle_max_length() {
+        assert_eq!(
+            validate_short_handle("exactly18charslol"),
+            Ok("exactly18charslol".to_string())
+        );
+        assert_eq!(
+            validate_short_handle("exactly18charslol1"),
+            Ok("exactly18charslol1".to_string())
+        );
+        assert_eq!(
+            validate_short_handle("exactly19characters"),
+            Err(HandleValidationError::TooLong {
+                max: MAX_SERVICE_HANDLE_LOCAL_PART
+            })
+        );
+        assert_eq!(
+            validate_short_handle("waytoolongusername123456789"),
+            Err(HandleValidationError::TooLong {
+                max: MAX_SERVICE_HANDLE_LOCAL_PART
+            })
+        );
+    }
+
+    #[test]
+    fn test_reserved_subdomains() {
+        assert_eq!(
+            validate_short_handle("admin"),
+            Err(HandleValidationError::Reserved)
+        );
+        assert_eq!(
+            validate_short_handle("api"),
+            Err(HandleValidationError::Reserved)
+        );
+        assert_eq!(
+            validate_short_handle("bsky"),
+            Err(HandleValidationError::Reserved)
+        );
+        assert_eq!(
+            validate_short_handle("barackobama"),
+            Err(HandleValidationError::Reserved)
+        );
+        assert_eq!(
+            validate_short_handle("ADMIN"),
+            Err(HandleValidationError::Reserved)
+        );
+        assert_eq!(validate_short_handle("alice"), Ok("alice".to_string()));
+        assert_eq!(
+            validate_short_handle("notreserved"),
+            Ok("notreserved".to_string())
+        );
+    }
+
+    #[test]
+    fn test_allow_reserved() {
+        assert_eq!(
+            validate_service_handle("admin", ReservedHandlePolicy::Allow),
+            Ok("admin".to_string())
+        );
+        assert_eq!(
+            validate_service_handle("api", ReservedHandlePolicy::Allow),
+            Ok("api".to_string())
+        );
+        assert_eq!(
+            validate_service_handle("admin", ReservedHandlePolicy::Reject),
+            Err(HandleValidationError::Reserved)
+        );
+    }
+
+    #[test]
+    fn test_valid_emails() {
+        assert!(is_valid_email("user@example.com"));
+        assert!(is_valid_email("user.name@example.com"));
+        assert!(is_valid_email("user+tag@example.com"));
+        assert!(is_valid_email("user@sub.example.com"));
+        assert!(is_valid_email("USER@EXAMPLE.COM"));
+        assert!(is_valid_email("user123@example123.com"));
+        assert!(is_valid_email("a@b.co"));
+    }
+    #[test]
+    fn test_invalid_emails() {
+        assert!(!is_valid_email(""));
+        assert!(!is_valid_email("user"));
+        assert!(!is_valid_email("user@"));
+        assert!(!is_valid_email("@example.com"));
+        assert!(!is_valid_email("user@example"));
+        assert!(!is_valid_email("user@@example.com"));
+        assert!(!is_valid_email("user@.example.com"));
+        assert!(!is_valid_email("user@example..com"));
+        assert!(!is_valid_email(".user@example.com"));
+        assert!(!is_valid_email("user.@example.com"));
+        assert!(!is_valid_email("user..name@example.com"));
+        assert!(!is_valid_email("user@-example.com"));
+        assert!(!is_valid_email("user@example-.com"));
+    }
+    #[test]
+    fn test_trimmed_whitespace() {
+        assert!(is_valid_email("  user@example.com  "));
+    }
+
+    #[test]
+    fn test_valid_discord_usernames() {
+        assert!(is_valid_discord_username("ab"));
+        assert!(is_valid_discord_username("alice"));
+        assert!(is_valid_discord_username("user_name"));
+        assert!(is_valid_discord_username("user.name"));
+        assert!(is_valid_discord_username("user123"));
+        assert!(is_valid_discord_username("a_b.c_d"));
+        assert!(is_valid_discord_username(
+            "12345678901234567890123456789012"
+        ));
+    }
+
+    #[test]
+    fn test_invalid_discord_usernames() {
+        assert!(!is_valid_discord_username(""));
+        assert!(!is_valid_discord_username("a"));
+        assert!(!is_valid_discord_username("Alice"));
+        assert!(!is_valid_discord_username("ALICE"));
+        assert!(!is_valid_discord_username("user-name"));
+        assert!(!is_valid_discord_username("user..name"));
+        assert!(!is_valid_discord_username("user name"));
+        assert!(!is_valid_discord_username(
+            "123456789012345678901234567890123"
+        ));
+    }
+}

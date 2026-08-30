@@ -1,0 +1,51 @@
+[package]
+name = "tranquil-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tranquil-pds = { workspace = true }
+tranquil-sync = { workspace = true }
+tranquil-api = { workspace = true }
+tranquil-oauth-server = { workspace = true }
+tranquil-config = { workspace = true }
+tranquil-signal = { workspace = true }
+
+arc-swap = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+dotenvy = { workspace = true }
+ed25519-dalek = { workspace = true }
+futures-util = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+quinn = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+
+[features]
+default = ["bsky", "frontend", "postgres", "s3", "valkey"]
+bsky = ["bsky-support", "tranquil-pds/bsky", "tranquil-api/bsky"]
+bsky-support = ["tranquil-pds/bsky-support", "tranquil-api/bsky-support"]
+frontend = ["tranquil-pds/frontend"]
+postgres = ["tranquil-pds/postgres"]
+s3 = ["tranquil-pds/s3"]
+valkey = ["tranquil-pds/valkey"]
+native-tls-roots = ["tranquil-pds/native-tls-roots"]

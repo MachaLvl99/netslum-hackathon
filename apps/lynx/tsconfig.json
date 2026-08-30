@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": true,
+    "jsx": "preserve",
+    "jsxImportSource": "@lynx-js/react",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "types": ["@lynx-js/types", "webmcp-types"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "lynx.config.ts"],
+  "exclude": ["dist"]
+}

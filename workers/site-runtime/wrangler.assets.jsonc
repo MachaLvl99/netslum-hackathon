@@ -1,0 +1,10 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "netslum-site-assets",
+  "main": "src/assets.ts",
+  "compatibility_date": "2026-08-27",
+  "workers_dev": true,
+  "d1_databases": [{ "binding": "DB", "database_name": "netslum", "database_id": "REPLACE_WITH_D1_ID" }],
+  "r2_buckets": [{ "binding": "SITE_FILES", "bucket_name": "netslum-sites", "preview_bucket_name": "netslum-sites-preview" }],
+  "vars": { "SITE_RUNTIME_ORIGIN": "https://netslum-site-runtime.REPLACE.workers.dev" }
+}

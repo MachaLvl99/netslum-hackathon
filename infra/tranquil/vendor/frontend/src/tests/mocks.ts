@@ -1,0 +1,401 @@
+import { vi } from "vitest";
+import type { AppPassword, InviteCode, Session } from "../lib/api.ts";
+import { _testResetState, _testSetState } from "../lib/auth.svelte.ts";
+import { clearAllToasts, getToasts, toast } from "../lib/toast.svelte.ts";
+import {
+  unsafeAsAccessToken,
+  unsafeAsDid,
+  unsafeAsEmail,
+  unsafeAsHandle,
+  unsafeAsInviteCode,
+  unsafeAsISODateString,
+  unsafeAsRefreshToken,
+} from "../lib/types/branded.ts";
+
+function createMockIndexedDB() {
+  const stores: Map<string, Map<string, unknown>> = new Map();
+
+  return {
+    open: vi.fn((_name: string, _version?: number) => {
+      const createTransaction = (_storeName: string, _mode?: string) => {
+        const tx = {
+          objectStore: (name: string) => {
+            if (!stores.has(name)) {
+              stores.set(name, new Map());
+            }
+            const store = stores.get(name)!;
+            return {
+              put: (value: unknown, key: string) => {
+                store.set(key, value);
+                return { result: undefined };
+              },
+              get: (key: string) => ({
+                result: store.get(key),
+              }),
+            };
+          },
+          oncomplete: null as (() => void) | null,
+          onerror: null as (() => void) | null,
+        };
+        setTimeout(() => tx.oncomplete?.(), 0);
+        return tx;
+      };
+
+      const request = {
+        result: {
+          objectStoreNames: { contains: () => true },
+          createObjectStore: vi.fn(),
+          transaction: createTransaction,
+          close: vi.fn(),
+        },
+        error: null,
+        onsuccess: null as (() => void) | null,
+        onerror: null as (() => void) | null,
+        onupgradeneeded: null as (() => void) | null,
+      };
+
+      setTimeout(() => {
+        request.onupgradeneeded?.();
+        request.onsuccess?.();
+      }, 0);
+
+      return request;
+    }),
+  };
+}
+
+export function setupIndexedDBMock(): void {
+  (globalThis as unknown as { indexedDB: unknown }).indexedDB =
+    createMockIndexedDB();
+}
+
+const originalPushState = globalThis.history.pushState.bind(globalThis.history);
+const originalReplaceState = globalThis.history.replaceState.bind(
+  globalThis.history,
+);
+
+globalThis.history.pushState = (
+  data: unknown,
+  unused: string,
+  url?: string | URL | null,
+) => {
+  originalPushState(data, unused, url);
+  if (url) {
+    const urlStr = typeof url === "string" ? url : url.toString();
+    Object.defineProperty(globalThis.location, "pathname", {
+      value: urlStr.split("?")[0],
+      writable: true,
+      configurable: true,
+    });
+  }
+};
+
+globalThis.history.replaceState = (
+  data: unknown,
+  unused: string,
+  url?: string | URL | null,
+) => {
+  originalReplaceState(data, unused, url);
+  if (url) {
+    const urlStr = typeof url === "string" ? url : url.toString();
+    Object.defineProperty(globalThis.location, "pathname", {
+      value: urlStr.split("?")[0],
+      writable: true,
+      configurable: true,
+    });
+  }
+};
+
+export interface MockResponse {
+  ok: boolean;
+  status: number;
+  json: () => Promise<unknown>;
+}
+export type MockHandler = (
+  url: string,
+  options?: RequestInit,
+) => MockResponse | Promise<MockResponse>;
+const mockHandlers: Map<string, MockHandler> = new Map();
+export function mockEndpoint(endpoint: string, handler: MockHandler): void {
+  mockHandlers.set(endpoint, handler);
+}
+export function mockEndpointOnce(endpoint: string, handler: MockHandler): void {
+  const originalHandler = mockHandlers.get(endpoint);
+  mockHandlers.set(endpoint, (url, options) => {
+    mockHandlers.set(endpoint, originalHandler!);
+    return handler(url, options);
+  });
+}
+export function clearMocks(): void {
+  mockHandlers.clear();
+  _testResetState();
+  clearAllToasts();
+}
+
+export function getErrorToasts(): string[] {
+  return getToasts()
+    .filter((t) => t.type === "error")
+    .map((t) => t.message);
+}
+
+export { getToasts, toast };
+function extractEndpoint(url: string): string {
+  const match = url.match(/\/xrpc\/([^?]+)/);
+  if (match) return match[1];
+  const pathOnly = url.split("?")[0];
+  return pathOnly;
+}
+export function setupFetchMock(): void {
+  globalThis.fetch = vi.fn(
+    async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = typeof input === "string" ? input : input.toString();
+      const endpoint = extractEndpoint(url);
+      const handler = mockHandlers.get(endpoint);
+      if (handler) {
+        const result = await handler(url, init);
+        return {
+          ok: result.ok,
+          status: result.status,
+          json: result.json,
+          text: async () => JSON.stringify(await result.json()),
+          headers: new Headers(),
+          redirected: false,
+          statusText: result.ok ? "OK" : "Error",
+          type: "basic",
+          url,
+          clone: () => ({ ...result }) as Response,
+          body: null,
+          bodyUsed: false,
+          arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+          blob: () => Promise.resolve(new Blob()),
+          formData: () => Promise.resolve(new FormData()),
+        } as Response;
+      }
+      return {
+        ok: false,
+        status: 404,
+        json: () =>
+          Promise.resolve({
+            error: "NotFound",
+            message: `No mock for ${endpoint}`,
+          }),
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              error: "NotFound",
+              message: `No mock for ${endpoint}`,
+            }),
+          ),
+        headers: new Headers(),
+        redirected: false,
+        statusText: "Not Found",
+        type: "basic",
+        url,
+        clone: function () {
+          return this;
+        },
+        body: null,
+        bodyUsed: false,
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+        blob: () => Promise.resolve(new Blob()),
+        formData: () => Promise.resolve(new FormData()),
+      } as Response;
+    },
+  );
+}
+export function jsonResponse<T>(data: T, status = 200): MockResponse {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: () => Promise.resolve(data),
+  };
+}
+export function errorResponse(
+  error: string,
+  message: string,
+  status = 400,
+): MockResponse {
+  return {
+    ok: false,
+    status,
+    json: () => Promise.resolve({ error, message }),
+  };
+}
+export const mockData = {
+  session: (overrides?: Partial<Session>): Session => {
+    const base = {
+      did: unsafeAsDid("did:web:test.tranquil.dev:u:testuser"),
+      handle: unsafeAsHandle("testuser.test.tranquil.dev"),
+      accessJwt: unsafeAsAccessToken("mock-access-jwt-token"),
+      refreshJwt: unsafeAsRefreshToken("mock-refresh-jwt-token"),
+      contactKind: "email" as const,
+      email: unsafeAsEmail("test@example.com"),
+      emailConfirmed: true,
+      accountKind: "active" as const,
+      isAdmin: false,
+    };
+    return { ...base, ...overrides } as Session;
+  },
+  appPassword: (overrides?: Partial<AppPassword>): AppPassword => ({
+    name: "Test App",
+    createdAt: unsafeAsISODateString(new Date().toISOString()),
+    ...overrides,
+  }),
+  inviteCode: (overrides?: Partial<InviteCode>): InviteCode => ({
+    code: unsafeAsInviteCode("test-invite-123"),
+    available: 1,
+    disabled: false,
+    forAccount: unsafeAsDid("did:web:test.tranquil.dev:u:testuser"),
+    createdBy: unsafeAsDid("did:web:test.tranquil.dev:u:testuser"),
+    createdAt: unsafeAsISODateString(new Date().toISOString()),
+    uses: [],
+    ...overrides,
+  }),
+  notificationPrefs: (overrides?: Record<string, unknown>) => ({
+    preferredChannel: "email",
+    email: "test@example.com",
+    discordUsername: null,
+    discordVerified: false,
+    telegramUsername: null,
+    telegramVerified: false,
+    signalUsername: null,
+    signalVerified: false,
+    ...overrides,
+  }),
+  describeServer: (overrides?: Record<string, unknown>) => ({
+    availableUserDomains: ["test.tranquil.dev"],
+    inviteCodeRequired: false,
+    did: "did:web:test.tranquil.dev",
+    contact: {
+      email: "admin@test.tranquil.dev",
+    },
+    links: {
+      privacyPolicy: "https://example.com/privacy",
+      termsOfService: "https://example.com/tos",
+    },
+    selfHostedDidWebEnabled: true,
+    availableCommsChannels: ["email", "discord", "telegram", "signal"],
+    discordBotUsername: "test-bot",
+    discordAppId: "123456789",
+    telegramBotUsername: "test_tg_bot",
+    ...overrides,
+  }),
+  serverStats: () => ({
+    userCount: 42,
+    repoCount: 42,
+    recordCount: 1234,
+    blobStorageBytes: 5678,
+  }),
+  describeRepo: (did: string) => ({
+    handle: "testuser.test.tranquil.dev",
+    did,
+    didDoc: {},
+    collections: [
+      "app.bsky.feed.post",
+      "app.bsky.feed.like",
+      "app.bsky.graph.follow",
+    ],
+    handleIsCorrect: true,
+  }),
+};
+export function setupDefaultMocks(): void {
+  setupFetchMock();
+  setupIndexedDBMock();
+  mockEndpoint(
+    "com.atproto.server.getSession",
+    () => jsonResponse(mockData.session()),
+  );
+  mockEndpoint("com.atproto.server.createSession", (_url, options) => {
+    const body = JSON.parse((options?.body as string) || "{}");
+    if (body.identifier && body.password === "correctpassword") {
+      return jsonResponse(
+        mockData.session({ handle: body.identifier.replace("@", "") }),
+      );
+    }
+    return errorResponse(
+      "AuthenticationRequired",
+      "Invalid identifier or password",
+      401,
+    );
+  });
+  mockEndpoint(
+    "com.atproto.server.refreshSession",
+    () => jsonResponse(mockData.session()),
+  );
+  mockEndpoint("com.atproto.server.deleteSession", () => jsonResponse({}));
+  mockEndpoint(
+    "com.atproto.server.listAppPasswords",
+    () => jsonResponse({ passwords: [mockData.appPassword()] }),
+  );
+  mockEndpoint("com.atproto.server.createAppPassword", (_url, options) => {
+    const body = JSON.parse((options?.body as string) || "{}");
+    return jsonResponse({
+      name: body.name,
+      password: "xxxx-xxxx-xxxx-xxxx",
+      createdAt: new Date().toISOString(),
+    });
+  });
+  mockEndpoint("com.atproto.server.revokeAppPassword", () => jsonResponse({}));
+  mockEndpoint(
+    "com.atproto.server.getAccountInviteCodes",
+    () => jsonResponse({ codes: [mockData.inviteCode()] }),
+  );
+  mockEndpoint(
+    "com.atproto.server.createInviteCode",
+    () => jsonResponse({ code: "new-invite-" + Date.now() }),
+  );
+  mockEndpoint(
+    "_account.getNotificationPrefs",
+    () => jsonResponse(mockData.notificationPrefs()),
+  );
+  mockEndpoint(
+    "_account.updateNotificationPrefs",
+    () => jsonResponse({ success: true }),
+  );
+  mockEndpoint(
+    "_account.getNotificationHistory",
+    () => jsonResponse({ notifications: [] }),
+  );
+  mockEndpoint(
+    "com.atproto.server.requestEmailUpdate",
+    () => jsonResponse({ tokenRequired: true }),
+  );
+  mockEndpoint("com.atproto.server.updateEmail", () => jsonResponse({}));
+  mockEndpoint("com.atproto.identity.updateHandle", () => jsonResponse({}));
+  mockEndpoint(
+    "com.atproto.server.requestAccountDelete",
+    () => jsonResponse({}),
+  );
+  mockEndpoint("com.atproto.server.deleteAccount", () => jsonResponse({}));
+  mockEndpoint(
+    "com.atproto.server.describeServer",
+    () => jsonResponse(mockData.describeServer()),
+  );
+  mockEndpoint("com.atproto.repo.describeRepo", (url) => {
+    const params = new URLSearchParams(url.split("?")[1]);
+    const repo = params.get("repo") || "did:web:test";
+    return jsonResponse(mockData.describeRepo(repo));
+  });
+  mockEndpoint(
+    "com.atproto.repo.listRecords",
+    () => jsonResponse({ records: [] }),
+  );
+}
+export function setupAuthenticatedUser(
+  sessionOverrides?: Partial<Session>,
+): Session {
+  const session = mockData.session(sessionOverrides);
+  _testSetState({
+    session,
+    loading: false,
+    error: null,
+  });
+  return session;
+}
+export function setupUnauthenticatedUser(): void {
+  _testSetState({
+    session: null,
+    loading: false,
+    error: null,
+  });
+}

@@ -1,0 +1,23 @@
+packages:
+  - apps/*
+  - packages/*
+  - workers/*
+
+allowBuilds:
+  core-js: true
+  esbuild: true
+  sharp: true
+  unrs-resolver: true
+  workerd: true
+
+minimumReleaseAgeExclude:
+  - miniflare@5.20260826.0-alpha
+  - wrangler@4.127.0
+
+onlyBuiltDependencies:
+  - esbuild
+  - sharp
+  - workerd
+
+patchedDependencies:
+  '@lynx-js/web-core@0.25.0': patches/@lynx-js__web-core@0.25.0.patch

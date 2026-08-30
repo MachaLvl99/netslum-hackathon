@@ -1,0 +1,69 @@
+services:
+  - type: web
+    name: netslum-pds
+    runtime: docker
+    rootDir: infra/tranquil
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: 0.5c-512mb
+    region: oregon
+    numInstances: 1
+    healthCheckPath: /xrpc/_health
+    domains:
+      - pds.netslum.macha.sh
+      - '*.pds.netslum.macha.sh'
+    disk:
+      name: tranquil-data
+      mountPath: /var/lib/tranquil-pds
+      sizeGB: 10
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: netslum-pds-db
+          property: connectionString
+      - key: PDS_HOSTNAME
+        value: pds.netslum.macha.sh
+      - key: PDS_USER_HANDLE_DOMAINS
+        value: pds.netslum.macha.sh
+      - key: SERVER_HOST
+        value: 0.0.0.0
+      - key: SERVER_PORT
+        value: '10000'
+      - key: PORT
+        value: '10000'
+      - key: TRUSTED_PROXY_COUNT
+        value: '1'
+      - key: DATABASE_MAX_CONNECTIONS
+        value: '20'
+      - key: DATABASE_MIN_CONNECTIONS
+        value: '2'
+      - key: REPO_BACKEND
+        value: postgres
+      - key: BLOB_STORAGE_BACKEND
+        value: filesystem
+      - key: BLOB_STORAGE_PATH
+        value: /var/lib/tranquil-pds/blobs
+      - key: INVITE_CODE_REQUIRED
+        value: 'true'
+      - key: DISABLE_ACCOUNT_VERIFICATION_GATE
+        value: 'true'
+      - key: ENABLE_PDS_HOSTED_DID_WEB
+        value: 'false'
+      - key: MAX_BLOB_SIZE
+        value: '5242880'
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DPOP_SECRET
+        generateValue: true
+      - key: MASTER_KEY
+        generateValue: true
+      - key: PLC_ROTATION_KEY
+        sync: false
+
+databases:
+  - name: netslum-pds-db
+    postgresMajorVersion: '18'
+    plan: 0.1c-256mb
+    region: oregon
+    diskSizeGB: 15
+    ipAllowList: []

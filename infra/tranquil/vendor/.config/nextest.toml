@@ -1,0 +1,159 @@
+[store]
+dir = "target/nextest"
+
+[profile.default]
+retries = 0
+fail-fast = true
+test-threads = "num-cpus"
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[profile.ci]
+retries = 2
+fail-fast = false
+test-threads = "num-cpus"
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[profile.sim-pr]
+retries = 0
+fail-fast = true
+test-threads = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+[profile.sim-nightly]
+retries = 0
+fail-fast = false
+test-threads = "num-cpus"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[profile.gauntlet-pr]
+retries = 0
+fail-fast = true
+test-threads = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.gauntlet-pr.overrides]]
+filter = "binary(gauntlet_smoke)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[profile.gauntlet-nightly]
+retries = 0
+fail-fast = false
+test-threads = "num-cpus"
+slow-timeout = { period = "600s", terminate-after = 1 }
+
+[profile.gauntlet-soak]
+retries = 0
+fail-fast = false
+test-threads = 1
+slow-timeout = { period = "5m", terminate-after = 1000 }
+
+[test-groups]
+serial-env-tests = { max-threads = 1 }
+heavy-load-tests = { max-threads = 4 }
+io-heavy-sim = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = "test(/import_with_verification/) | test(/plc_migration/)"
+test-group = "serial-env-tests"
+
+[[profile.default.overrides]]
+filter = "binary(handle_domains)"
+test-group = "serial-env-tests"
+
+[[profile.default.overrides]]
+filter = "binary(ripple_cluster)"
+test-group = "serial-env-tests"
+
+[[profile.default.overrides]]
+filter = "package(tranquil-signal)"
+test-group = "serial-env-tests"
+
+[[profile.default.overrides]]
+filter = "package(tranquil-config)"
+test-group = "serial-env-tests"
+
+[[profile.default.overrides]]
+filter = "binary(whole_story)"
+test-group = "heavy-load-tests"
+
+[[profile.default.overrides]]
+filter = "test(/two_node_stress_concurrent_load/)"
+test-group = "heavy-load-tests"
+
+[[profile.default.overrides]]
+filter = "binary(repo_lifecycle)"
+test-group = "heavy-load-tests"
+
+[[profile.default.overrides]]
+filter = "binary(sim_soak)"
+slow-timeout = { period = "300s", terminate-after = 10 }
+test-group = "io-heavy-sim"
+
+[[profile.default.overrides]]
+filter = "binary(metastore_crash) | binary(sim_cross_store) | binary(sim_gc_concurrent) | binary(sim_reachability) | binary(sim_eventlog) | test(/sim_/)"
+slow-timeout = { period = "120s", terminate-after = 8 }
+test-group = "io-heavy-sim"
+
+[[profile.default.overrides]]
+filter = "test(/test_scale_/) | test(/full_backup_and_restore/)"
+slow-timeout = { period = "120s", terminate-after = 4 }
+
+[[profile.default.overrides]]
+filter = "binary(gauntlet_smoke)"
+slow-timeout = { period = "300s", terminate-after = 8 }
+
+[[profile.default.overrides]]
+filter = "binary(compaction_restart) | binary(mst_refcount_integrity) | binary(gc_compaction_restart)"
+slow-timeout = { period = "120s", terminate-after = 4 }
+
+[[profile.default.overrides]]
+filter = "test(/retention_time_travel_survives_many_seeds/)"
+slow-timeout = { period = "300s", terminate-after = 24 }
+test-group = "io-heavy-sim"
+
+[[profile.default.overrides]]
+filter = "binary(fd_lifecycle)"
+slow-timeout = { period = "300s", terminate-after = 4 }
+test-group = "io-heavy-sim"
+
+[[profile.ci.overrides]]
+filter = "test(/import_with_verification/) | test(/plc_migration/)"
+test-group = "serial-env-tests"
+
+[[profile.ci.overrides]]
+filter = "binary(handle_domains)"
+test-group = "serial-env-tests"
+
+[[profile.ci.overrides]]
+filter = "binary(ripple_cluster)"
+test-group = "serial-env-tests"
+
+[[profile.ci.overrides]]
+filter = "package(tranquil-signal)"
+test-group = "serial-env-tests"
+
+[[profile.ci.overrides]]
+filter = "package(tranquil-config)"
+test-group = "serial-env-tests"
+
+[[profile.ci.overrides]]
+filter = "binary(whole_story)"
+test-group = "heavy-load-tests"
+
+[[profile.ci.overrides]]
+filter = "test(/two_node_stress_concurrent_load/)"
+test-group = "heavy-load-tests"
+
+[[profile.ci.overrides]]
+filter = "binary(repo_lifecycle)"
+test-group = "heavy-load-tests"
+
+[[profile.ci.overrides]]
+filter = "test(/retention_time_travel_survives_many_seeds/)"
+slow-timeout = { period = "300s", terminate-after = 24 }
+test-group = "io-heavy-sim"
+
+[[profile.ci.overrides]]
+filter = "binary(fd_lifecycle)"
+slow-timeout = { period = "300s", terminate-after = 4 }
+test-group = "io-heavy-sim"

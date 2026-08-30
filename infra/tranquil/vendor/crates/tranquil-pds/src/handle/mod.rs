@@ -1,0 +1,112 @@
+pub mod reserved;
+
+use crate::types::{Did, Handle};
+use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum HandleResolutionError {
+    #[error("DNS lookup failed: {0}")]
+    DnsError(String),
+    #[error("HTTP request failed: {0}")]
+    HttpError(String),
+    #[error("No DID found for handle")]
+    NotFound,
+    #[error("Invalid DID format in record")]
+    InvalidDid,
+    #[error("DID mismatch: expected {expected}, got {actual}")]
+    DidMismatch { expected: Did, actual: Did },
+}
+
+pub async fn resolve_handle_dns(handle: &Handle) -> Result<Did, HandleResolutionError> {
+    let resolver = TokioAsyncResolver::tokio_from_system_conf().unwrap_or_else(|e| {
+        tracing::warn!("falling back to default DNS resolvers: {}", e);
+        TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())
+    });
+    let query_name = format!("_atproto.{}", handle);
+    let txt_lookup = resolver
+        .txt_lookup(&query_name)
+        .await
+        .map_err(|e| HandleResolutionError::DnsError(e.to_string()))?;
+    txt_lookup
+        .iter()
+        .flat_map(|record| record.txt_data())
+        .find_map(|txt| {
+            let txt_str = String::from_utf8_lossy(txt);
+            txt_str
+                .strip_prefix("did=")
+                .and_then(|did| Did::new(did.trim()).ok())
+        })
+        .ok_or(HandleResolutionError::NotFound)
+}
+
+pub async fn resolve_handle_http(handle: &Handle) -> Result<Did, HandleResolutionError> {
+    let url = format!("https://{}/.well-known/atproto-did", handle);
+    let client = crate::api::proxy_client::handle_resolution_client();
+    let response = client
+        .get(&url)
+        .header("Accept", "text/plain")
+        .send()
+        .await
+        .map_err(|e| HandleResolutionError::HttpError(e.to_string()))?;
+    if !response.status().is_success() {
+        return Err(HandleResolutionError::NotFound);
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|e| HandleResolutionError::HttpError(e.to_string()))?;
+    Did::new(body.trim()).map_err(|_| HandleResolutionError::InvalidDid)
+}
+
+pub async fn resolve_handle(handle: &Handle) -> Result<Did, HandleResolutionError> {
+    match resolve_handle_dns(handle).await {
+        Ok(did) => return Ok(did),
+        Err(e) => {
+            tracing::debug!("DNS resolution failed for {}: {}, trying HTTP", handle, e);
+        }
+    }
+    resolve_handle_http(handle).await
+}
+
+pub async fn verify_handle_ownership(
+    handle: &Handle,
+    expected_did: &Did,
+) -> Result<(), HandleResolutionError> {
+    let resolved_did = resolve_handle(handle).await?;
+    if resolved_did == *expected_did {
+        Ok(())
+    } else {
+        Err(HandleResolutionError::DidMismatch {
+            expected: expected_did.clone(),
+            actual: resolved_did,
+        })
+    }
+}
+
+pub fn is_service_domain_handle(handle: &str, hostname: &str) -> bool {
+    if !handle.contains('.') {
+        return true;
+    }
+    let service_domains = tranquil_config::try_get()
+        .map(|c| c.server.user_handle_domain_list())
+        .unwrap_or_else(|| vec![hostname.to_string()]);
+    service_domains
+        .iter()
+        .any(|domain| handle.ends_with(&format!(".{}", domain)) || handle == domain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_service_domain_handle() {
+        assert!(is_service_domain_handle("nel.oyster.cafe", "oyster.cafe"));
+        assert!(is_service_domain_handle("oyster.cafe", "oyster.cafe"));
+        assert!(is_service_domain_handle("myhandle", "oyster.cafe"));
+        assert!(!is_service_domain_handle("lyna.nel.pet", "oyster.cafe"));
+        assert!(!is_service_domain_handle("myhandle.xyz", "oyster.cafe"));
+    }
+}

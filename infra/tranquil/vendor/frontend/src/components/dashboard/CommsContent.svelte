@@ -1,0 +1,352 @@
+<script lang="ts">
+  import { onMount } from 'svelte'
+  import { refreshSession } from '../../lib/auth.svelte'
+  import { api, ApiError } from '../../lib/api'
+  import { _ } from '../../lib/i18n'
+  import { formatDateTime } from '../../lib/date'
+  import type { Session } from '../../lib/types/api'
+  import { toast } from '../../lib/toast.svelte'
+
+  interface Props {
+    session: Session
+  }
+
+  let { session }: Props = $props()
+
+  let loading = $state(true)
+  let saving = $state(false)
+  let preferredChannel = $state('email')
+  let availableCommsChannels = $state<string[]>(['email'])
+  let telegramBotUsername = $state<string | undefined>(undefined)
+  let discordBotUsername = $state<string | undefined>(undefined)
+  let discordAppId = $state<string | undefined>(undefined)
+  let email = $state('')
+  let discordUsername = $state('')
+  let discordVerified = $state(false)
+  let telegramUsername = $state('')
+  let telegramVerified = $state(false)
+  let signalUsername = $state('')
+  let signalVerified = $state(false)
+  let savedDiscordUsername = $state('')
+  let savedTelegramUsername = $state('')
+  let savedSignalUsername = $state('')
+  let verifyingChannel = $state<string | null>(null)
+  let verificationCode = $state('')
+  let historyLoading = $state(true)
+  let messages = $state<Array<{
+    createdAt: string
+    channel: string
+    notificationType: string
+    status: string
+    subject: string | null
+    body: string
+  }>>([])
+
+  onMount(() => {
+    loadPrefs()
+    loadHistory()
+  })
+
+  async function loadPrefs() {
+    loading = true
+    try {
+      const [prefs, serverInfo] = await Promise.all([
+        api.getNotificationPrefs(session.accessJwt),
+        api.describeServer()
+      ])
+      preferredChannel = prefs.preferredChannel
+      email = prefs.email
+      discordUsername = prefs.discordUsername ?? ''
+      discordVerified = prefs.discordVerified
+      telegramUsername = prefs.telegramUsername ?? ''
+      telegramVerified = prefs.telegramVerified
+      signalUsername = prefs.signalUsername ?? ''
+      signalVerified = prefs.signalVerified
+      savedDiscordUsername = discordUsername
+      savedTelegramUsername = telegramUsername
+      savedSignalUsername = signalUsername
+      availableCommsChannels = serverInfo.availableCommsChannels ?? ['email']
+      telegramBotUsername = serverInfo.telegramBotUsername
+      discordBotUsername = serverInfo.discordBotUsername
+      discordAppId = serverInfo.discordAppId
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : $_('comms.failedToLoad'))
+    } finally {
+      loading = false
+    }
+  }
+
+  async function handleSave(e: Event) {
+    e.preventDefault()
+    saving = true
+    try {
+      const result = await api.updateNotificationPrefs(session.accessJwt, {
+        preferredChannel,
+        discordUsername: discordUsername !== savedDiscordUsername ? discordUsername : undefined,
+        telegramUsername: telegramUsername !== savedTelegramUsername ? telegramUsername : undefined,
+        signalUsername: signalUsername !== savedSignalUsername ? signalUsername : undefined,
+      })
+      await refreshSession()
+      toast.success($_('comms.preferencesSaved'))
+      savedDiscordUsername = discordUsername
+      savedTelegramUsername = telegramUsername
+      savedSignalUsername = signalUsername
+      const channelToVerify = result.verificationRequired?.find(
+        (ch: string) => ch === 'discord' || ch === 'telegram' || ch === 'signal'
+      )
+      if (channelToVerify) {
+        verifyingChannel = channelToVerify
+        verificationCode = ''
+      }
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : $_('comms.failedToSave'))
+    } finally {
+      saving = false
+    }
+  }
+
+  async function handleVerify(channel: string) {
+    if (!verificationCode) return
+
+    const identifierMap: Record<string, string> = {
+      discord: discordUsername,
+      telegram: telegramUsername,
+      signal: signalUsername
+    }
+    const identifier = identifierMap[channel]
+    if (!identifier) return
+
+    try {
+      await api.confirmChannelVerification(session.accessJwt, channel, identifier, verificationCode)
+      await refreshSession()
+      toast.success($_('comms.verifiedSuccess', { values: { channel } }))
+      verificationCode = ''
+      verifyingChannel = null
+      await loadPrefs()
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : $_('comms.failedToVerify'))
+    }
+  }
+
+  async function loadHistory() {
+    historyLoading = true
+    try {
+      const result = await api.getNotificationHistory(session.accessJwt)
+      messages = result.notifications
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : $_('comms.failedToLoadHistory'))
+    } finally {
+      historyLoading = false
+    }
+  }
+
+  function formatDate(dateStr: string): string {
+    return formatDateTime(dateStr)
+  }
+
+  const channels = ['email', 'discord', 'telegram', 'signal']
+
+  function getChannelName(id: string): string {
+    const names: Record<string, () => string> = {
+      email: () => $_('register.email'),
+      discord: () => $_('register.discord'),
+      telegram: () => $_('register.telegram'),
+      signal: () => $_('register.signal')
+    }
+    return names[id]?.() ?? id
+  }
+
+  function getChannelDescription(id: string): string {
+    const descriptions: Record<string, () => string> = {
+      email: () => $_('comms.emailVia'),
+      discord: () => $_('comms.discordVia'),
+      telegram: () => $_('comms.telegramVia'),
+      signal: () => $_('comms.signalVia')
+    }
+    return descriptions[id]?.() ?? ''
+  }
+
+  function isChannelAvailableOnServer(channelId: string): boolean {
+    return availableCommsChannels.includes(channelId)
+  }
+
+  function canSelectChannel(channelId: string): boolean {
+    if (!isChannelAvailableOnServer(channelId)) return false
+    if (channelId === 'email') return true
+    const hasIdentifier: Record<string, boolean> = {
+      discord: !!discordUsername,
+      telegram: !!telegramUsername,
+      signal: !!signalUsername
+    }
+    return hasIdentifier[channelId] ?? false
+  }
+</script>
+
+<div class="comms">
+  {#if loading}
+    <div class="loading">{$_('common.loading')}</div>
+  {:else}
+    <form onsubmit={handleSave}>
+      <section>
+        <h3>{$_('comms.preferredChannel')}</h3>
+        <div class="channel-options">
+          {#each channels as channelId}
+            <label class="channel-option" class:disabled={!canSelectChannel(channelId)} class:unavailable={!isChannelAvailableOnServer(channelId)}>
+              <input
+                type="radio"
+                name="preferredChannel"
+                value={channelId}
+                bind:group={preferredChannel}
+                disabled={!canSelectChannel(channelId) || saving}
+              />
+              <div class="channel-info">
+                <span class="channel-name">{getChannelName(channelId)}</span>
+                <span class="channel-desc">{getChannelDescription(channelId)}</span>
+              </div>
+              {#if !isChannelAvailableOnServer(channelId)}
+                <span class="channel-hint">{$_('comms.notConfiguredOnServer')}</span>
+              {:else if channelId !== 'email' && !canSelectChannel(channelId)}
+                <span class="channel-hint">{$_('comms.configureToEnable')}</span>
+              {/if}
+            </label>
+          {/each}
+        </div>
+      </section>
+
+      <section>
+        <h3>{$_('comms.channelConfiguration')}</h3>
+        <div class="channel-config">
+          <div class="config-item">
+            <div class="config-header">
+              <label for="email">{$_('register.email')}</label>
+              <span class="status verified">
+                {preferredChannel === 'email' ? $_('comms.primary') : $_('comms.verified')}
+              </span>
+            </div>
+            <input id="email" type="email" value={email} disabled class="readonly" />
+          </div>
+
+          {#if isChannelAvailableOnServer('discord')}
+            <div class="config-item">
+              <div class="config-header">
+                <label for="discord">{$_('register.discordUsername')}</label>
+                {#if discordUsername}
+                  <span class="status" class:verified={discordVerified} class:unverified={!discordVerified}>
+                    {preferredChannel === 'discord' && discordVerified ? $_('comms.primary') : discordVerified ? $_('comms.verified') : $_('comms.notVerified')}
+                  </span>
+                {/if}
+              </div>
+              <div class="config-input">
+                <input
+                  id="discord"
+                  type="text"
+                  bind:value={discordUsername}
+                  placeholder={$_('register.discordUsernamePlaceholder')}
+                  disabled={saving}
+                />
+              </div>
+              {#if discordUsername && discordUsername === savedDiscordUsername && !discordVerified && discordBotUsername}
+                {@const encodedHandle = session.handle.replaceAll('.', '_')}
+                <div class="discord-verify-prompt">
+                  {#if discordAppId}
+                    <a href="https://discord.com/users/{discordAppId}" target="_blank" rel="noopener">{$_('comms.discordOpenLink')}</a>
+                  {/if}
+                  <span class="manual-hint">{$_('comms.discordStartBot', { values: { botUsername: discordBotUsername, handle: session.handle } })}</span>
+                </div>
+              {/if}
+            </div>
+          {/if}
+
+          {#if isChannelAvailableOnServer('telegram')}
+            <div class="config-item">
+              <div class="config-header">
+                <label for="telegram">{$_('register.telegramUsername')}</label>
+                {#if telegramUsername}
+                  <span class="status" class:verified={telegramVerified} class:unverified={!telegramVerified}>
+                    {preferredChannel === 'telegram' && telegramVerified ? $_('comms.primary') : telegramVerified ? $_('comms.verified') : $_('comms.notVerified')}
+                  </span>
+                {/if}
+              </div>
+              <div class="config-input">
+                <input
+                  id="telegram"
+                  type="text"
+                  bind:value={telegramUsername}
+                  placeholder={$_('register.telegramUsernamePlaceholder')}
+                  disabled={saving}
+                />
+              </div>
+              {#if telegramUsername && telegramUsername === savedTelegramUsername && !telegramVerified && telegramBotUsername}
+                {@const encodedHandle = session.handle.replaceAll('.', '_')}
+                <div class="telegram-verify-prompt">
+                  <a href="https://t.me/{telegramBotUsername}?start={encodedHandle}" target="_blank" rel="noopener">{$_('comms.telegramOpenLink')}</a>
+                  <span class="manual-hint">{$_('comms.telegramStartBot', { values: { botUsername: telegramBotUsername, handle: session.handle } })}</span>
+                </div>
+              {/if}
+            </div>
+          {/if}
+
+          {#if isChannelAvailableOnServer('signal')}
+            <div class="config-item">
+              <div class="config-header">
+                <label for="signal">{$_('register.signalUsername')}</label>
+                {#if signalUsername}
+                  <span class="status" class:verified={signalVerified} class:unverified={!signalVerified}>
+                    {preferredChannel === 'signal' && signalVerified ? $_('comms.primary') : signalVerified ? $_('comms.verified') : $_('comms.notVerified')}
+                  </span>
+                {/if}
+              </div>
+              <div class="config-input">
+                <input
+                  id="signal"
+                  type="text"
+                  bind:value={signalUsername}
+                  placeholder={$_('register.signalUsernamePlaceholder')}
+                  disabled={saving}
+                />
+              </div>
+              {#if signalUsername && signalUsername === savedSignalUsername && !signalVerified}
+                <div class="verify-form">
+                  <input type="text" bind:value={verificationCode} placeholder={$_('comms.verifyCodePlaceholder')} maxlength="512" />
+                  <button type="button" onclick={() => handleVerify('signal')}>{$_('comms.submit')}</button>
+                </div>
+              {/if}
+            </div>
+          {/if}
+        </div>
+      </section>
+
+      <div class="actions">
+        <button type="submit" disabled={saving}>
+          {saving ? $_('common.saving') : $_('comms.savePreferences')}
+        </button>
+      </div>
+    </form>
+
+    <section class="history-section">
+      <h3>{$_('comms.messageHistory')}</h3>
+      {#if historyLoading}
+        <div class="loading">{$_('common.loading')}</div>
+      {:else if messages.length === 0}
+        <p class="empty">{$_('comms.noMessages')}</p>
+      {:else}
+        <div class="message-list">
+          {#each messages as msg}
+            <div class="message-item">
+              <div class="message-header">
+                <span class="message-type">{msg.notificationType}</span>
+                <span class="message-channel">{msg.channel}</span>
+                <span class="message-status" class:sent={msg.status === 'sent'} class:failed={msg.status === 'failed'}>{msg.status}</span>
+              </div>
+              {#if msg.subject}
+                <div class="message-subject">{msg.subject}</div>
+              {/if}
+              <div class="message-body">{msg.body}</div>
+              <div class="message-date">{formatDate(msg.createdAt)}</div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </section>
+  {/if}
+</div>

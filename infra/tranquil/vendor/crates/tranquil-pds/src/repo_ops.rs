@@ -1,0 +1,1415 @@
+use crate::api::error::ApiError;
+use crate::cid_types::{CommitCid, RecordCid};
+use crate::repo::TrackingBlockStore;
+use crate::state::AppState;
+use crate::types::{Did, Handle, Nsid, Rkey};
+use backon::{ExponentialBuilder, Retryable};
+use bytes::Bytes;
+use cid::Cid;
+use jacquard_common::smol_str::SmolStr;
+use jacquard_common::types::{integer::LimitedU32, string::Tid};
+use jacquard_repo::commit::Commit;
+use jacquard_repo::mst::util::compute_cid;
+use jacquard_repo::mst::{Mst, VerifiedWriteOp};
+use jacquard_repo::storage::BlockStore;
+use k256::ecdsa::SigningKey;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
+use tokio::sync::OwnedMutexGuard;
+use tracing::{error, warn};
+use uuid::Uuid;
+
+#[derive(Debug)]
+pub enum CommitError {
+    InvalidDid(String),
+    SigningFailed(String),
+    SerializationFailed(String),
+    KeyNotFound,
+    KeyDecryptionFailed(String),
+    InvalidKey(String),
+    BlockStoreFailed(String),
+    RepoNotFound,
+    ConcurrentModification,
+    DatabaseError(String),
+    UserNotFound,
+    CommitParseFailed(String),
+    MstOperationFailed(String),
+    RecordSerializationFailed(String),
+    InvalidCid(String),
+    RecordAlreadyExists(String),
+}
+
+impl std::fmt::Display for CommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidDid(e) => write!(f, "Invalid DID: {}", e),
+            Self::SigningFailed(e) => write!(f, "Failed to sign commit: {}", e),
+            Self::SerializationFailed(e) => write!(f, "Failed to serialize signed commit: {}", e),
+            Self::KeyNotFound => write!(f, "Signing key not found"),
+            Self::KeyDecryptionFailed(e) => write!(f, "Failed to decrypt signing key: {}", e),
+            Self::InvalidKey(e) => write!(f, "Invalid signing key: {}", e),
+            Self::BlockStoreFailed(e) => write!(f, "Block store operation failed: {}", e),
+            Self::RepoNotFound => write!(f, "Repo not found"),
+            Self::ConcurrentModification => {
+                write!(f, "Repo has been modified since last read")
+            }
+            Self::DatabaseError(e) => write!(f, "Database error: {}", e),
+            Self::UserNotFound => write!(f, "User not found"),
+            Self::CommitParseFailed(e) => write!(f, "Failed to parse commit: {}", e),
+            Self::MstOperationFailed(e) => write!(f, "MST operation failed: {}", e),
+            Self::RecordSerializationFailed(e) => {
+                write!(f, "Failed to serialize record: {}", e)
+            }
+            Self::InvalidCid(e) => write!(f, "Invalid CID: {}", e),
+            Self::RecordAlreadyExists(key) => write!(f, "Record already exists at {}", key),
+        }
+    }
+}
+
+impl std::error::Error for CommitError {}
+
+impl From<CommitError> for ApiError {
+    fn from(err: CommitError) -> Self {
+        match err {
+            CommitError::ConcurrentModification => {
+                ApiError::InvalidSwap(Some("Repo has been modified".into()))
+            }
+            CommitError::RepoNotFound => ApiError::RepoNotFound(None),
+            CommitError::UserNotFound => ApiError::RepoNotFound(Some("User not found".into())),
+            CommitError::RecordAlreadyExists(key) => {
+                ApiError::InvalidRequest(format!("Record already exists at {key}"))
+            }
+            other => {
+                error!("Commit failed: {}", other);
+                ApiError::InternalError(Some("Failed to commit changes".into()))
+            }
+        }
+    }
+}
+
+pub async fn get_current_root_cid(state: &AppState, user_id: Uuid) -> Result<CommitCid, ApiError> {
+    let root_cid_str = state
+        .repos
+        .repo
+        .get_repo_root_cid_by_user_id(user_id)
+        .await
+        .map_err(|e| {
+            error!("DB error fetching repo root: {}", e);
+            ApiError::InternalError(None)
+        })?
+        .ok_or_else(|| ApiError::InternalError(Some("Repo root not found".into())))?;
+    CommitCid::from_str(&root_cid_str)
+        .map_err(|_| ApiError::InternalError(Some("Invalid repo root CID".into())))
+}
+
+pub fn extract_blob_cids(record: &Value) -> Vec<crate::types::CidLink> {
+    crate::sync::import::find_blob_refs(record, 0)
+        .into_iter()
+        .map(|b| b.cid)
+        .collect()
+}
+
+use crate::types::AtUri;
+use tranquil_db_traits::{Backlink, BacklinkPath};
+
+// TODO: it really really should not be necessary to extract backlinks and store those.
+// especially not in a way that isnt generic.
+// figure out what the fuck is going on here
+// (lewis do you remember why you did this???)
+pub fn extract_backlinks(uri: &AtUri, record: &Value) -> Vec<Backlink> {
+    let record_type = record
+        .get("$type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    match record_type {
+        "app.bsky.graph.follow" | "app.bsky.graph.block" => record
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.starts_with("did:"))
+            .map(|subject| {
+                vec![Backlink {
+                    uri: uri.clone(),
+                    path: BacklinkPath::Subject,
+                    link_to: subject.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        "app.bsky.feed.like" | "app.bsky.feed.repost" => record
+            .get("subject")
+            .and_then(|v| v.get("uri"))
+            .and_then(|v| v.as_str())
+            .filter(|s| s.starts_with("at://"))
+            .map(|subject_uri| {
+                vec![Backlink {
+                    uri: uri.clone(),
+                    path: BacklinkPath::SubjectUri,
+                    link_to: subject_uri.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+pub struct RepoWriteContext {
+    pub tracking_store: TrackingBlockStore,
+    pub current_root_cid: Cid,
+    pub prev_commit_bytes: Bytes,
+    pub prev_data_cid: Cid,
+    pub write_lock: OwnedMutexGuard<()>,
+}
+
+pub struct FinalizeParams<'a> {
+    pub did: &'a Did,
+    pub user_id: Uuid,
+    pub controller_did: Option<&'a Did>,
+    pub delegation_detail: Option<serde_json::Value>,
+    pub ops: Vec<RecordOp>,
+    pub blob_cids: &'a [crate::types::CidLink],
+    pub backlinks_to_add: Vec<Backlink>,
+    pub backlinks_to_remove: Vec<AtUri>,
+}
+
+pub async fn begin_repo_write(
+    state: &AppState,
+    user_id: Uuid,
+    swap_commit: Option<&str>,
+) -> Result<(RepoWriteContext, Mst<TrackingBlockStore>), ApiError> {
+    let write_lock = state.repo_write_locks.lock(user_id).await;
+
+    let root_cid_str = state
+        .repos
+        .repo
+        .get_repo_root_cid_by_user_id(user_id)
+        .await
+        .map_err(|e| {
+            error!("DB error fetching repo root: {}", e);
+            ApiError::InternalError(None)
+        })?
+        .ok_or_else(|| ApiError::InternalError(Some("Repo root not found".into())))?;
+
+    let current_root_cid = Cid::from_str(root_cid_str.as_str())
+        .map_err(|_| ApiError::InternalError(Some("Invalid repo root CID".into())))?;
+
+    if let Some(expected) = swap_commit {
+        let expected_cid = Cid::from_str(expected)
+            .map_err(|_| ApiError::InvalidSwap(Some("Invalid swap commit CID".into())))?;
+        if expected_cid != current_root_cid {
+            return Err(ApiError::InvalidSwap(Some("Repo has been modified".into())));
+        }
+    }
+
+    let tracking_store = TrackingBlockStore::new(state.block_store.clone());
+    let commit_bytes = tracking_store
+        .get(&current_root_cid)
+        .await
+        .map_err(|e| {
+            error!("Failed to load commit block: {}", e);
+            ApiError::InternalError(None)
+        })?
+        .ok_or_else(|| ApiError::InternalError(Some("Commit block not found".into())))?;
+
+    let prev_data_cid = Commit::from_cbor(&commit_bytes)
+        .map_err(|e| {
+            error!("Failed to parse commit: {}", e);
+            ApiError::InternalError(None)
+        })?
+        .data;
+
+    let mst = Mst::load(Arc::new(tracking_store.clone()), prev_data_cid, None);
+
+    let ctx = RepoWriteContext {
+        tracking_store,
+        current_root_cid,
+        prev_commit_bytes: commit_bytes,
+        prev_data_cid,
+        write_lock,
+    };
+
+    Ok((ctx, mst))
+}
+
+pub async fn repair_repo_structure(
+    state: &AppState,
+    user_id: Uuid,
+) -> Result<tranquil_store::blockstore::RepairOutcome, ApiError> {
+    let _write_lock = state.repo_write_locks.lock(user_id).await;
+
+    let root_cid_str = state
+        .repos
+        .repo
+        .get_repo_root_cid_by_user_id(user_id)
+        .await
+        .map_err(|e| {
+            error!("repair: DB error fetching repo root: {}", e);
+            ApiError::InternalError(None)
+        })?
+        .ok_or_else(|| ApiError::InternalError(Some("Repo root not found".into())))?;
+    let current_root_cid = Cid::from_str(root_cid_str.as_str())
+        .map_err(|_| ApiError::InternalError(Some("Invalid repo root CID".into())))?;
+
+    let commit_bytes = state
+        .block_store
+        .get(&current_root_cid)
+        .await
+        .map_err(|e| {
+            error!("repair: failed to load commit block: {}", e);
+            ApiError::InternalError(None)
+        })?
+        .ok_or_else(|| ApiError::InternalError(Some("Commit block not found".into())))?;
+    let commit = Commit::from_cbor(&commit_bytes).map_err(|e| {
+        error!("repair: failed to parse commit: {}", e);
+        ApiError::InternalError(None)
+    })?;
+    let data_root = commit.data;
+    let repo_rev = crate::types::Tid::from(commit.rev().clone());
+
+    let records = state
+        .repos
+        .repo
+        .get_all_records(user_id)
+        .await
+        .map_err(|e| {
+            error!("repair: get_all_records failed: {}", e);
+            ApiError::InternalError(None)
+        })?;
+    let entries: Vec<(String, Cid)> = records
+        .into_iter()
+        .filter_map(|r| {
+            Cid::from_str(r.record_cid.as_str())
+                .ok()
+                .map(|cid| (format!("{}/{}", r.collection, r.rkey), cid))
+        })
+        .collect();
+
+    warn!(
+        user_id = %user_id,
+        records = entries.len(),
+        "repair: rebuilding full MST from record set"
+    );
+
+    let outcome = state
+        .block_store
+        .repair_structure(&entries, data_root)
+        .await
+        .map_err(|e| {
+            error!("repair: structural repair failed: {}", e);
+            ApiError::InternalError(Some("Structural repair failed".into()))
+        })?;
+
+    if outcome.nodes_repaired > 0 {
+        let leaf_present = futures::future::try_join_all(
+            entries.iter().map(|(_, cid)| state.block_store.has(cid)),
+        )
+        .await
+        .map_err(|e| {
+            error!("repair: leaf presence check failed: {e}");
+            ApiError::InternalError(None)
+        })?;
+        let missing: Vec<Cid> = entries
+            .iter()
+            .zip(leaf_present)
+            .filter_map(|((_, cid), present)| (!present).then_some(*cid))
+            .collect();
+        if !missing.is_empty() {
+            error!(
+                user_id = %user_id,
+                missing = missing.len(),
+                sample = ?missing.iter().take(5).map(|c| c.to_string()).collect::<Vec<_>>(),
+                "repair: unrecoverable leaf data loss after structural repair"
+            );
+            return Err(ApiError::InternalError(Some(format!(
+                "unrecoverable leaf data loss: {} record block(s) missing after structural repair",
+                missing.len()
+            ))));
+        }
+    }
+
+    let walk = crate::scheduled::collect_current_repo_blocks(&state.block_store, &current_root_cid)
+        .await
+        .map_err(|e| {
+            error!("repair: re-walk for user_blocks backfill failed: {}", e);
+            ApiError::InternalError(None)
+        })?;
+
+    let recorded = state
+        .repos
+        .repo
+        .get_user_block_cids_since_rev(user_id, None)
+        .await
+        .map_err(|e| {
+            error!("repair: reading recorded user_blocks set failed: {}", e);
+            ApiError::InternalError(None)
+        })?;
+    let reachable: HashSet<&[u8]> = walk.block_cids.iter().map(Vec::as_slice).collect();
+    let stale: Vec<Vec<u8>> = match walk.is_complete() {
+        true => recorded
+            .into_iter()
+            .filter(|cid| !reachable.contains(cid.as_slice()))
+            .collect(),
+        false => {
+            error!(
+                user_id = %user_id,
+                unreadable = walk.unreadable,
+                "repair: repo walk couldn't read every block, so its complement isn't the \
+                 unreachable set. Backfilling without pruning."
+            );
+            Vec::new()
+        }
+    };
+
+    state
+        .repos
+        .repo
+        .insert_user_blocks(user_id, &walk.block_cids, &repo_rev)
+        .await
+        .map_err(|e| {
+            error!("repair: user_blocks backfill failed: {}", e);
+            ApiError::InternalError(None)
+        })?;
+    if !stale.is_empty() {
+        state
+            .repos
+            .repo
+            .delete_user_blocks(user_id, &stale)
+            .await
+            .map_err(|e| {
+                error!("repair: pruning unreachable user_blocks rows failed: {}", e);
+                ApiError::InternalError(None)
+            })?;
+    }
+    warn!(
+        user_id = %user_id,
+        blocks = walk.block_cids.len(),
+        pruned = stale.len(),
+        "repair: rewrote user_blocks from current DAG"
+    );
+
+    Ok(outcome)
+}
+
+pub async fn with_repair_retry<T, F, Fut>(
+    state: &AppState,
+    user_id: Uuid,
+    mut attempt: F,
+) -> Result<T, ApiError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ApiError>>,
+{
+    match attempt().await {
+        Err(e) if e.is_repo_corruption() => {
+            warn!(
+                "structural MST damage during repo write for user {user_id}, repairing and retrying"
+            );
+            match repair_repo_structure(state, user_id).await {
+                Ok(outcome) if outcome.nodes_repaired > 0 => attempt().await,
+                Ok(_) => {
+                    warn!(
+                        user_id = %user_id,
+                        "structural repair rewrote no nodes; damage is not in the MST structure, returning original error without retry"
+                    );
+                    Err(e)
+                }
+                Err(repair_err) => {
+                    error!(user_id = %user_id, "structural repair failed: {repair_err:?}");
+                    Err(e)
+                }
+            }
+        }
+        other => other,
+    }
+}
+
+const REPAIR_COOLDOWN: Duration = Duration::from_secs(60);
+const REPAIR_NOOP_COOLDOWN: Duration = Duration::from_secs(600);
+
+struct RepairSlot {
+    in_flight: bool,
+    next_allowed: Instant,
+}
+
+struct RepairGuard {
+    slots: parking_lot::Mutex<HashMap<Uuid, RepairSlot>>,
+}
+
+impl RepairGuard {
+    fn try_claim(&self, user_id: Uuid, now: Instant) -> bool {
+        let mut slots = self.slots.lock();
+        let slot = slots.entry(user_id).or_insert(RepairSlot {
+            in_flight: false,
+            next_allowed: now,
+        });
+        if slot.in_flight || now < slot.next_allowed {
+            return false;
+        }
+        slot.in_flight = true;
+        true
+    }
+
+    fn release(&self, user_id: Uuid, now: Instant, cooldown: Duration) {
+        if let Some(slot) = self.slots.lock().get_mut(&user_id) {
+            slot.in_flight = false;
+            slot.next_allowed = now + cooldown;
+        }
+    }
+}
+
+static REPAIR_GUARD: LazyLock<RepairGuard> = LazyLock::new(|| RepairGuard {
+    slots: parking_lot::Mutex::new(HashMap::new()),
+});
+
+struct RepairLease {
+    user_id: Uuid,
+    cooldown: Duration,
+}
+
+impl Drop for RepairLease {
+    fn drop(&mut self) {
+        REPAIR_GUARD.release(self.user_id, Instant::now(), self.cooldown);
+    }
+}
+
+pub fn schedule_repo_repair(state: &AppState, user_id: Uuid) {
+    if !REPAIR_GUARD.try_claim(user_id, Instant::now()) {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut lease = RepairLease {
+            user_id,
+            cooldown: REPAIR_COOLDOWN,
+        };
+        match repair_repo_structure(&state, user_id).await {
+            Ok(outcome) => {
+                if outcome.nodes_repaired == 0 {
+                    lease.cooldown = REPAIR_NOOP_COOLDOWN;
+                }
+                warn!(
+                    user_id = %user_id,
+                    nodes_repaired = outcome.nodes_repaired,
+                    nodes_total = outcome.nodes_total,
+                    "background MST repair complete"
+                );
+            }
+            Err(e) => error!(user_id = %user_id, "background MST repair failed: {e:?}"),
+        }
+    });
+}
+
+async fn leaves_referenced_elsewhere(
+    state: &AppState,
+    user_id: Uuid,
+    dropped_leaves: &BTreeSet<Cid>,
+    ops: &[RecordOp],
+) -> BTreeSet<Cid> {
+    if dropped_leaves.is_empty() {
+        return BTreeSet::new();
+    }
+    let by_link: BTreeMap<crate::types::CidLink, Cid> = dropped_leaves
+        .iter()
+        .map(|cid| (crate::types::CidLink::from_cid(cid), *cid))
+        .collect();
+    let cids: Vec<crate::types::CidLink> = by_link.keys().cloned().collect();
+    // Because the commit only runs later on, records table still shows
+    // this write's pre-write state at this point
+    // so excluding the keys that this write touches is the thing that
+    // keeps a deleted record from counting as a reference to its own block.
+    let touched: Vec<(&Nsid, &Rkey)> = ops.iter().map(RecordOp::collection_rkey).collect();
+    // The two failure directions aren't symmetric at all
+    // because a user_blocks row for a block that's already gone is only noise
+    // that the scheduled repair clears...
+    // While a *missing* row for a block that's still reachable
+    // makes `getRepo` with a since-cursor give an incomplete tree
+    // and thus any doubt at all about the lookup ought to mean keeping every row.
+    let keep_everything = |reason: &str| {
+        error!(
+            user_id = %user_id,
+            "{reason}. Keeping the user_blocks row for every record block this write removed. \
+             Their refcounts still drop, so a row may remain after its block is gone until the \
+             scheduled structural repair rewrites the set."
+        );
+        schedule_repo_repair(state, user_id);
+        dropped_leaves.clone()
+    };
+    match state
+        .repos
+        .repo
+        .referenced_record_cids(user_id, &cids, &touched)
+        .await
+    {
+        Ok(referenced) => referenced
+            .iter()
+            .map(|link| by_link.get(link).copied())
+            .collect::<Option<BTreeSet<Cid>>>()
+            .unwrap_or_else(|| {
+                keep_everything("record cid reference lookup returned a cid that wasn't queried")
+            }),
+        Err(e) => keep_everything(&format!("record cid reference lookup failed: {e:?}")),
+    }
+}
+
+pub async fn reachable_tree_cids<S: BlockStore + Sync + 'static>(
+    mst: &Mst<S>,
+) -> Result<BTreeSet<Cid>, jacquard_repo::error::RepoError> {
+    let nodes = mst.collect_node_cids().await?;
+    let leaves = mst.leaves().await?;
+    Ok(nodes
+        .into_iter()
+        .chain(leaves.into_iter().map(|(_, cid)| cid))
+        .collect())
+}
+
+pub async fn finalize_repo_write(
+    state: &AppState,
+    ctx: RepoWriteContext,
+    mst: Mst<TrackingBlockStore>,
+    params: FinalizeParams<'_>,
+) -> Result<CommitResult, ApiError> {
+    let new_mst_root = mst
+        .persist()
+        .await
+        .map_err(|e| ApiError::from_mst_error("MST persist", &e))?;
+
+    let written_bytes = ctx.tracking_store.take_written_blocks();
+
+    let storage_for_proof = Arc::new(ctx.tracking_store.clone());
+    let original_settled = Mst::load(storage_for_proof.clone(), ctx.prev_data_cid, None);
+    let new_settled = Mst::load(storage_for_proof.clone(), new_mst_root, None);
+
+    let mut inverse_trace = new_settled.clone();
+    let mut non_invertible: Vec<String> = Vec::new();
+    let mut invert_errors: Vec<String> = Vec::new();
+    for op in params.ops.iter().rev() {
+        let (collection, rkey) = op.collection_rkey();
+        let key = SmolStr::new(format!("{}/{}", collection, rkey));
+        let verified = match op {
+            RecordOp::Create { cid, .. } => VerifiedWriteOp::Create {
+                key,
+                cid: *cid.as_cid(),
+            },
+            RecordOp::Update { cid, prev, .. } => VerifiedWriteOp::Update {
+                key,
+                cid: *cid.as_cid(),
+                prev: *prev.as_cid(),
+            },
+            RecordOp::Delete { prev, .. } => VerifiedWriteOp::Delete {
+                key,
+                prev: *prev.as_cid(),
+            },
+        };
+        match inverse_trace.invert_op(verified.clone()).await {
+            Ok(true) => {}
+            Ok(false) => non_invertible.push(format!("{:?}", verified)),
+            Err(e) => invert_errors.push(format!("{:?} -> {:?}", verified, e)),
+        }
+    }
+    if !non_invertible.is_empty() {
+        warn!(
+            user_id = %params.user_id,
+            count = non_invertible.len(),
+            ops = ?non_invertible,
+            "firehose proof walk: ops not invertible on new MST, consumer will reject frame"
+        );
+    }
+    if !invert_errors.is_empty() {
+        warn!(
+            user_id = %params.user_id,
+            count = invert_errors.len(),
+            failures = ?invert_errors,
+            "firehose proof walk: invert_op errored, cover blocks may be incomplete"
+        );
+    }
+
+    let read_cid_set: HashSet<Cid> = ctx.tracking_store.get_read_cids().into_iter().collect();
+    let missing_read_cids: Vec<Cid> = read_cid_set
+        .iter()
+        .copied()
+        .filter(|cid| !written_bytes.contains_key(cid))
+        .collect();
+    let mut relevant: BTreeMap<Cid, Bytes> = BTreeMap::new();
+    if !missing_read_cids.is_empty() {
+        let fetched = ctx
+            .tracking_store
+            .get_many(&missing_read_cids)
+            .await
+            .map_err(|e| {
+                error!("fetch cover read bytes: {e}");
+                ApiError::InternalError(None)
+            })?;
+        for (cid, maybe) in missing_read_cids.into_iter().zip(fetched) {
+            if let Some(bytes) = maybe {
+                relevant.insert(cid, bytes);
+            }
+        }
+    }
+
+    let replaced_refs: Vec<Cid> = params
+        .ops
+        .iter()
+        .filter_map(RecordOp::replaced_cid)
+        .collect();
+
+    let (new_tree_cids, new_mst_bytes, dropped) = match original_settled.diff(&new_settled).await {
+        Ok(diff) => {
+            // The moment that a leaf CID leaves its old position (leaves, get it)
+            // the diff will report it as removed
+            // even where the new tree goes on using that same block somewhere else
+            // so filtering the removed leaves against `live` will stop this write
+            // from dropping a block the new tree still needs.
+            // The diffing minuses the unchanged nodes from `removed_mst_blocks` itself
+            // and the same filter only covers a node which matches the new root.
+            let live: BTreeSet<Cid> = diff
+                .new_mst_blocks
+                .keys()
+                .copied()
+                .chain(diff.new_leaf_cids.iter().copied())
+                .chain(std::iter::once(new_mst_root))
+                .collect();
+            let dropped_leaves: BTreeSet<Cid> = diff
+                .removed_cids
+                .iter()
+                .copied()
+                .filter(|cid| !live.contains(cid))
+                .collect();
+            let still_referenced =
+                leaves_referenced_elsewhere(state, params.user_id, &dropped_leaves, &params.ops)
+                    .await;
+            let removed_mst_blocks: Vec<Cid> = diff
+                .removed_mst_blocks
+                .iter()
+                .copied()
+                .filter(|cid| !live.contains(cid))
+                .collect();
+
+            // These sets have distinct purposes:
+            // - `unreachable` deletes user_blocks rows
+            //   and so has to leave out any block another record still references
+            // - `decrements` drops one refcount for every ref this write released
+            //   including the replaced record CIDs that other records
+            //   continue on referencing
+            //
+            // Neither set includes the previous data root
+            // since the diff reports subtree nodes and never a root of its own.
+            // So that block keeps its refcount and its user_blocks row
+            // until the leaked-refcount sweep reclaims it.
+            let dropped = DroppedBlocks {
+                unreachable: std::iter::once(ctx.current_root_cid)
+                    .chain(removed_mst_blocks.iter().copied())
+                    .chain(
+                        dropped_leaves
+                            .iter()
+                            .copied()
+                            .filter(|cid| !still_referenced.contains(cid)),
+                    )
+                    .collect(),
+                decrements: std::iter::once(ctx.current_root_cid)
+                    .chain(removed_mst_blocks)
+                    .chain(replaced_refs)
+                    .collect(),
+            };
+            (live.into_iter().collect(), diff.new_mst_blocks, dropped)
+        }
+        Err(e) => {
+            error!(
+                user_id = %params.user_id,
+                "MST diff failed during finalize_repo_write: {e}. Walking the new MST insetad \
+                 and scheduling a structural repair."
+            );
+            schedule_repo_repair(state, params.user_id);
+            let dropped = DroppedBlocks {
+                unreachable: vec![ctx.current_root_cid],
+                decrements: std::iter::once(ctx.current_root_cid)
+                    .chain(replaced_refs)
+                    .collect(),
+            };
+            match reachable_tree_cids(&new_settled).await {
+                Ok(cids) => (cids.into_iter().collect(), BTreeMap::new(), dropped),
+                Err(walk_err) => {
+                    error!(
+                        "MST walk after diff failure also failed: {walk_err}. \
+                         Recording only blocks this write observed and the commit CID. \
+                         user_blocks stays incomplete until a structural repair rewrites the tree."
+                    );
+                    (
+                        written_bytes.keys().copied().collect(),
+                        BTreeMap::new(),
+                        dropped,
+                    )
+                }
+            }
+        }
+    };
+
+    // Under jacquard-repo 0.9 that tranquil pins for now,
+    // `Mst::persist` skips any subtree that's already in store
+    // so `written_bytes` under-reports the new node set
+    // and `new_mst_blocks` is full
+    // where each of these blocks still needs a `put` to take a refcount
+    // even though its bytes are already on disk.
+    let recovered: Vec<(Cid, Bytes)> = new_mst_bytes
+        .iter()
+        .filter(|(cid, _)| !written_bytes.contains_key(*cid))
+        .map(|(cid, bytes)| (*cid, bytes.clone()))
+        .collect();
+    if !recovered.is_empty() {
+        state.block_store.put_many(recovered).await.map_err(|e| {
+            error!("failed to reference MST blocks recovered from the diff: {e}");
+            ApiError::InternalError(None)
+        })?;
+    }
+
+    let mut block_bytes = written_bytes;
+    block_bytes.extend(relevant);
+    block_bytes.extend(new_mst_bytes);
+
+    let result = commit_and_log(
+        state,
+        CommitParams {
+            did: params.did,
+            user_id: params.user_id,
+            current_root_cid: Some(ctx.current_root_cid),
+            prev_commit_bytes: Some(ctx.prev_commit_bytes),
+            prev_data_cid: Some(ctx.prev_data_cid),
+            new_mst_root,
+            ops: params.ops,
+            block_bytes,
+            new_tree_cids,
+            blobs: params.blob_cids,
+            dropped,
+            backlinks_to_add: params.backlinks_to_add,
+            backlinks_to_remove: params.backlinks_to_remove,
+        },
+    )
+    .await?;
+
+    if let Some(controller_did) = params.controller_did
+        && let Some(detail) = params.delegation_detail
+        && let Err(e) = state
+            .repos
+            .delegation
+            .log_delegation_action(
+                params.did,
+                controller_did,
+                Some(controller_did),
+                tranquil_db_traits::DelegationActionType::RepoWrite,
+                Some(detail),
+                None,
+                None,
+            )
+            .await
+    {
+        tracing::warn!("Failed to log delegation audit: {:?}", e);
+    }
+
+    Ok(result)
+}
+
+pub fn create_signed_commit(
+    did: &Did,
+    data: Cid,
+    rev: &Tid,
+    prev: Option<Cid>,
+    signing_key: &SigningKey,
+) -> Result<(Vec<u8>, Bytes), CommitError> {
+    let did = jacquard_common::types::string::Did::new(did.as_str())
+        .map_err(|e| CommitError::InvalidDid(format!("{:?}", e)))?;
+    let unsigned = Commit::new_unsigned(did, data, rev.clone(), prev);
+    let signed = unsigned
+        .sign(signing_key)
+        .map_err(|e| CommitError::SigningFailed(format!("{:?}", e)))?;
+    let sig_bytes = signed.sig().clone();
+    let signed_bytes = signed
+        .to_cbor()
+        .map_err(|e| CommitError::SerializationFailed(e.to_string()))?;
+    Ok((signed_bytes, sig_bytes))
+}
+
+pub enum RecordOp {
+    Create {
+        collection: Nsid,
+        rkey: Rkey,
+        cid: RecordCid,
+    },
+    Update {
+        collection: Nsid,
+        rkey: Rkey,
+        cid: RecordCid,
+        prev: RecordCid,
+    },
+    Delete {
+        collection: Nsid,
+        rkey: Rkey,
+        prev: RecordCid,
+    },
+}
+
+impl RecordOp {
+    pub fn replaced_cid(&self) -> Option<Cid> {
+        match self {
+            Self::Create { .. } => None,
+            Self::Update { prev, .. } | Self::Delete { prev, .. } => Some(*prev.as_cid()),
+        }
+    }
+
+    pub fn collection_rkey(&self) -> (&Nsid, &Rkey) {
+        match self {
+            Self::Create {
+                collection, rkey, ..
+            }
+            | Self::Update {
+                collection, rkey, ..
+            }
+            | Self::Delete {
+                collection, rkey, ..
+            } => (collection, rkey),
+        }
+    }
+}
+
+pub struct CommitResult {
+    pub commit_cid: Cid,
+    pub rev: crate::types::Tid,
+}
+
+pub struct DroppedBlocks {
+    pub unreachable: Vec<Cid>,
+    pub decrements: Vec<Cid>,
+}
+
+pub struct CommitParams<'a> {
+    pub did: &'a Did,
+    pub user_id: Uuid,
+    pub current_root_cid: Option<Cid>,
+    pub prev_commit_bytes: Option<Bytes>,
+    pub prev_data_cid: Option<Cid>,
+    pub new_mst_root: Cid,
+    pub ops: Vec<RecordOp>,
+    pub block_bytes: std::collections::HashMap<Cid, Bytes>,
+    pub new_tree_cids: Vec<Cid>,
+    pub blobs: &'a [crate::types::CidLink],
+    pub dropped: DroppedBlocks,
+    pub backlinks_to_add: Vec<Backlink>,
+    pub backlinks_to_remove: Vec<AtUri>,
+}
+
+pub async fn commit_and_log(
+    state: &AppState,
+    params: CommitParams<'_>,
+) -> Result<CommitResult, CommitError> {
+    use tranquil_db_traits::{
+        ApplyCommitError, ApplyCommitInput, CommitEventData, EventBlockInline, RecordDelete,
+        RecordUpsert, RepoEventType,
+    };
+
+    let CommitParams {
+        did,
+        user_id,
+        current_root_cid,
+        prev_commit_bytes,
+        prev_data_cid,
+        new_mst_root,
+        ops,
+        mut block_bytes,
+        new_tree_cids,
+        blobs,
+        dropped,
+        backlinks_to_add,
+        backlinks_to_remove,
+    } = params;
+    debug_assert_eq!(
+        current_root_cid.is_some(),
+        prev_commit_bytes.is_some(),
+        "current_root_cid and prev_commit_bytes must be both Some (non-genesis) or both None (genesis)"
+    );
+    let key_row = state
+        .repos
+        .user
+        .get_user_key_by_id(user_id)
+        .await
+        .map_err(|e| CommitError::DatabaseError(format!("Failed to fetch signing key: {}", e)))?
+        .ok_or(CommitError::KeyNotFound)?;
+    let key_bytes = crate::config::decrypt_key(&key_row.key_bytes, key_row.encryption_version)
+        .map_err(|e| CommitError::KeyDecryptionFailed(e.to_string()))?;
+    let signing_key =
+        SigningKey::from_slice(&key_bytes).map_err(|e| CommitError::InvalidKey(e.to_string()))?;
+    let rev = Tid::now(LimitedU32::MIN);
+    let repo_rev = crate::types::Tid::from(rev.clone());
+    let (new_commit_bytes, _sig) =
+        create_signed_commit(did, new_mst_root, &rev, current_root_cid, &signing_key)?;
+    let new_root_cid =
+        compute_cid(&new_commit_bytes).map_err(|e| CommitError::BlockStoreFailed(e.to_string()))?;
+
+    let commit_bytes_owned = Bytes::from(new_commit_bytes.clone());
+    state
+        .block_store
+        .put(&new_commit_bytes)
+        .await
+        .map_err(|e| CommitError::BlockStoreFailed(format!("failed to write commit block: {e}")))?;
+
+    block_bytes.insert(new_root_cid, commit_bytes_owned);
+
+    if let (Some(prev_root), Some(prev_bytes)) = (current_root_cid, prev_commit_bytes) {
+        block_bytes.entry(prev_root).or_insert(prev_bytes);
+    }
+
+    let all_block_cids: Vec<Vec<u8>> = new_tree_cids
+        .iter()
+        .chain(std::iter::once(&new_root_cid))
+        .map(|c| c.to_bytes())
+        .collect();
+
+    let obsolete_bytes: Vec<Vec<u8>> = dropped.unreachable.iter().map(|c| c.to_bytes()).collect();
+
+    let final_ops: HashMap<(&Nsid, &Rkey), &RecordOp> =
+        ops.iter().map(|op| (op.collection_rkey(), op)).collect();
+
+    let final_record_uris: HashSet<AtUri> = final_ops
+        .iter()
+        .filter(|(_, op)| !matches!(op, RecordOp::Delete { .. }))
+        .map(|((c, r), _)| AtUri::from_parts(did, c, r))
+        .collect();
+
+    let record_upserts: Vec<RecordUpsert> = final_ops
+        .values()
+        .filter_map(|op| match op {
+            RecordOp::Create {
+                collection,
+                rkey,
+                cid,
+            }
+            | RecordOp::Update {
+                collection,
+                rkey,
+                cid,
+                ..
+            } => Some(RecordUpsert {
+                collection: collection.clone(),
+                rkey: rkey.clone(),
+                cid: crate::types::CidLink::from(cid.as_cid()),
+            }),
+            RecordOp::Delete { .. } => None,
+        })
+        .collect();
+
+    let record_deletes: Vec<RecordDelete> = final_ops
+        .values()
+        .filter_map(|op| match op {
+            RecordOp::Delete {
+                collection, rkey, ..
+            } => Some(RecordDelete {
+                collection: collection.clone(),
+                rkey: rkey.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+
+    let backlinks_to_add: Vec<Backlink> = backlinks_to_add
+        .into_iter()
+        .filter(|b| final_record_uris.contains(&b.uri))
+        .map(|b| ((b.uri.clone(), b.path), b))
+        .collect::<HashMap<_, _>>()
+        .into_values()
+        .collect();
+
+    let backlinks_to_remove: Vec<AtUri> = backlinks_to_remove
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    let ops_json: Vec<serde_json::Value> = ops
+        .iter()
+        .map(|op| match op {
+            RecordOp::Create {
+                collection,
+                rkey,
+                cid,
+            } => json!({
+                "action": "create",
+                "path": format!("{}/{}", collection, rkey),
+                "cid": cid.to_string()
+            }),
+            RecordOp::Update {
+                collection,
+                rkey,
+                cid,
+                prev,
+            } => json!({
+                "action": "update",
+                "path": format!("{}/{}", collection, rkey),
+                "cid": cid.to_string(),
+                "prev": prev.to_string(),
+            }),
+            RecordOp::Delete {
+                collection,
+                rkey,
+                prev,
+            } => json!({
+                "action": "delete",
+                "path": format!("{}/{}", collection, rkey),
+                "cid": null,
+                "prev": prev.to_string(),
+            }),
+        })
+        .collect();
+
+    let inline_blocks: Vec<EventBlockInline> = block_bytes
+        .iter()
+        .map(|(cid, data)| EventBlockInline {
+            cid_bytes: cid.to_bytes(),
+            data: data.to_vec(),
+        })
+        .collect();
+
+    let commit_event = CommitEventData {
+        did: did.clone(),
+        event_type: RepoEventType::Commit,
+        commit_cid: Some(crate::types::CidLink::from(new_root_cid)),
+        prev_cid: current_root_cid.map(crate::types::CidLink::from),
+        ops: Some(json!(ops_json)),
+        blobs: Some(blobs.to_vec()),
+        blocks: Some(inline_blocks),
+        prev_data_cid: prev_data_cid.map(crate::types::CidLink::from),
+        rev: Some(repo_rev.clone()),
+    };
+
+    let input = ApplyCommitInput {
+        user_id,
+        did: did.clone(),
+        expected_root_cid: current_root_cid.map(crate::types::CidLink::from),
+        new_root_cid: crate::types::CidLink::from(new_root_cid),
+        new_rev: repo_rev.clone(),
+        new_block_cids: all_block_cids,
+        obsolete_block_cids: obsolete_bytes,
+        record_upserts,
+        record_deletes,
+        backlinks_to_add,
+        backlinks_to_remove,
+        commit_event,
+    };
+
+    let _result = state
+        .repos
+        .repo
+        .apply_commit(input)
+        .await
+        .map_err(|e| match e {
+            ApplyCommitError::RepoNotFound => CommitError::RepoNotFound,
+            ApplyCommitError::ConcurrentModification => CommitError::ConcurrentModification,
+            ApplyCommitError::Database(msg) => CommitError::DatabaseError(msg),
+        })?;
+
+    let apply_result = (|| {
+        let bs = state.block_store.clone();
+        let decrements = dropped.decrements.clone();
+        async move { bs.decrement_refs(&decrements).await }
+    })
+    .retry(
+        ExponentialBuilder::default()
+            .with_min_delay(std::time::Duration::from_millis(50))
+            .with_max_delay(std::time::Duration::from_secs(2))
+            .with_max_times(5),
+    )
+    .await;
+
+    if let Err(e) = apply_result {
+        let leaked: Vec<String> = dropped.decrements.iter().map(Cid::to_string).collect();
+        tracing::error!(
+            error = %e,
+            user_id = %user_id,
+            new_root = %new_root_cid,
+            leaked_cids = ?leaked,
+            "blockstore decrement_refs failed after metastore commit succeeded \
+             and exhausted retries; blocks may leak refcounts"
+        );
+    }
+
+    Ok(CommitResult {
+        commit_cid: new_root_cid,
+        rev: repo_rev,
+    })
+}
+pub async fn create_record_internal(
+    state: &AppState,
+    did: &Did,
+    collection: &Nsid,
+    rkey: &Rkey,
+    record: &serde_json::Value,
+) -> Result<(String, Cid), CommitError> {
+    let user_id: Uuid = state
+        .repos
+        .user
+        .get_id_by_did(did)
+        .await
+        .map_err(|e| CommitError::DatabaseError(e.to_string()))?
+        .ok_or(CommitError::UserNotFound)?;
+
+    let to_commit_err = |e: ApiError| CommitError::DatabaseError(format!("{:?}", e));
+
+    let (ctx, mst) = begin_repo_write(state, user_id, None)
+        .await
+        .map_err(to_commit_err)?;
+
+    let key = format!("{}/{}", collection, rkey);
+    if mst
+        .get(&key)
+        .await
+        .map_err(|e| CommitError::MstOperationFailed(e.to_string()))?
+        .is_some()
+    {
+        return Err(CommitError::RecordAlreadyExists(key));
+    }
+
+    let record_ipld = crate::util::json_to_ipld(record);
+    let mut record_bytes = Vec::new();
+    serde_ipld_dagcbor::to_writer(&mut record_bytes, &record_ipld)
+        .map_err(|e| CommitError::RecordSerializationFailed(e.to_string()))?;
+    let record_cid = ctx
+        .tracking_store
+        .put(&record_bytes)
+        .await
+        .map_err(|e| CommitError::BlockStoreFailed(e.to_string()))?;
+    let new_mst = mst
+        .add(&key, record_cid)
+        .await
+        .map_err(|e| CommitError::MstOperationFailed(e.to_string()))?;
+
+    let op = RecordOp::Create {
+        collection: collection.clone(),
+        rkey: rkey.clone(),
+        cid: RecordCid::from(record_cid),
+    };
+    let blob_cids = extract_blob_cids(record);
+    let record_uri = AtUri::from_parts(did, collection, rkey);
+    let backlinks = extract_backlinks(&record_uri, record);
+
+    let result = finalize_repo_write(
+        state,
+        ctx,
+        new_mst,
+        FinalizeParams {
+            did,
+            user_id,
+            controller_did: None,
+            delegation_detail: None,
+            ops: vec![op],
+            blob_cids: &blob_cids,
+            backlinks_to_add: backlinks,
+            backlinks_to_remove: vec![],
+        },
+    )
+    .await
+    .map_err(to_commit_err)?;
+
+    let uri = format!("at://{}/{}/{}", did, collection, rkey);
+    Ok((uri, result.commit_cid))
+}
+
+pub async fn sequence_identity_event(
+    state: &AppState,
+    did: &Did,
+    handle: Option<&Handle>,
+) -> Result<(), CommitError> {
+    state
+        .repos
+        .repo
+        .insert_identity_event(did, handle)
+        .await
+        .map_err(|e| CommitError::DatabaseError(format!("identity event: {}", e)))
+}
+pub async fn sequence_account_event(
+    state: &AppState,
+    did: &Did,
+    status: tranquil_db_traits::AccountStatus,
+) -> Result<(), CommitError> {
+    state
+        .repos
+        .repo
+        .insert_account_event(did, status)
+        .await
+        .map_err(|e| CommitError::DatabaseError(format!("account event: {}", e)))
+}
+pub async fn sequence_sync_event(
+    state: &AppState,
+    did: &Did,
+    commit_cid: &crate::types::CidLink,
+    rev: Option<&crate::types::Tid>,
+) -> Result<(), CommitError> {
+    let commit_cid_parsed = commit_cid
+        .to_cid()
+        .ok_or_else(|| CommitError::InvalidCid(commit_cid.to_string()))?;
+    let commit_bytes = state
+        .block_store
+        .get(&commit_cid_parsed)
+        .await
+        .map_err(|e| CommitError::BlockStoreFailed(format!("{:?}", e)))?
+        .ok_or(CommitError::BlockStoreFailed(
+            "Commit block not found for sync event".into(),
+        ))?;
+    state
+        .repos
+        .repo
+        .insert_sync_event(did, commit_cid, rev, &commit_bytes)
+        .await
+        .map_err(|e| CommitError::DatabaseError(format!("sync event: {}", e)))
+}
+
+pub async fn sequence_genesis_commit(
+    state: &AppState,
+    did: &Did,
+    commit_cid: &Cid,
+    mst_root_cid: &Cid,
+    rev: &crate::types::Tid,
+) -> Result<(), CommitError> {
+    let commit_cid_link = crate::types::CidLink::from(commit_cid);
+    let mst_root_cid_link = crate::types::CidLink::from(mst_root_cid);
+    let commit_bytes = state
+        .block_store
+        .get(commit_cid)
+        .await
+        .map_err(|e| CommitError::BlockStoreFailed(format!("{:?}", e)))?
+        .ok_or(CommitError::BlockStoreFailed(
+            "Genesis commit block not found".into(),
+        ))?;
+    let mst_root_bytes = state
+        .block_store
+        .get(mst_root_cid)
+        .await
+        .map_err(|e| CommitError::BlockStoreFailed(format!("{:?}", e)))?
+        .ok_or(CommitError::BlockStoreFailed(
+            "Genesis MST root block not found".into(),
+        ))?;
+    state
+        .repos
+        .repo
+        .insert_genesis_commit_event(
+            did,
+            &commit_cid_link,
+            &mst_root_cid_link,
+            rev,
+            &commit_bytes,
+            &mst_root_bytes,
+        )
+        .await
+        .map_err(|e| CommitError::DatabaseError(format!("genesis commit event: {}", e)))
+}
+
+#[cfg(test)]
+mod repair_guard_tests {
+    use super::*;
+
+    fn guard() -> RepairGuard {
+        RepairGuard {
+            slots: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn claim_dedups_in_flight_then_respects_cooldown() {
+        let g = guard();
+        let user = Uuid::from_u128(1);
+        let t0 = Instant::now();
+
+        assert!(g.try_claim(user, t0), "first claim must succeed");
+        assert!(
+            !g.try_claim(user, t0),
+            "second claim while a repair is in flight must be rejected"
+        );
+
+        g.release(user, t0, REPAIR_COOLDOWN);
+        assert!(
+            !g.try_claim(user, t0 + Duration::from_secs(1)),
+            "claim within the cooldown window must be rejected"
+        );
+        assert!(
+            g.try_claim(user, t0 + REPAIR_COOLDOWN + Duration::from_millis(1)),
+            "claim after the cooldown window must succeed"
+        );
+    }
+
+    #[test]
+    fn distinct_users_do_not_block_each_other() {
+        let g = guard();
+        let t0 = Instant::now();
+        assert!(g.try_claim(Uuid::from_u128(1), t0));
+        assert!(g.try_claim(Uuid::from_u128(2), t0));
+    }
+
+    #[test]
+    fn concurrent_claims_for_one_user_admit_exactly_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let g = Arc::new(guard());
+        let user = Uuid::from_u128(42);
+        let now = Instant::now();
+        let winners = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Barrier::new(32));
+
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                let g = Arc::clone(&g);
+                let winners = Arc::clone(&winners);
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    gate.wait();
+                    if g.try_claim(user, now) {
+                        winners.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .for_each(|h| h.join().expect("worker thread panicked"));
+
+        assert_eq!(
+            winners.load(Ordering::Relaxed),
+            1,
+            "exactly one concurrent claim must win the dedup race"
+        );
+    }
+
+    #[test]
+    fn release_re_enables_claim_after_cooldown_for_recurring_corruption() {
+        let g = guard();
+        let user = Uuid::from_u128(7);
+        let t0 = Instant::now();
+
+        assert!(g.try_claim(user, t0));
+        g.release(user, t0, REPAIR_COOLDOWN);
+        let after_cooldown = t0 + REPAIR_COOLDOWN + Duration::from_millis(1);
+        assert!(
+            g.try_claim(user, after_cooldown),
+            "a fresh corruption after the cooldown must be repairable again"
+        );
+        assert!(
+            !g.try_claim(user, after_cooldown),
+            "the re-claimed repair must again dedup while in flight"
+        );
+    }
+
+    #[test]
+    fn noop_repair_uses_longer_cooldown() {
+        let g = guard();
+        let user = Uuid::from_u128(9);
+        let t0 = Instant::now();
+
+        assert!(g.try_claim(user, t0));
+        g.release(user, t0, REPAIR_NOOP_COOLDOWN);
+        assert!(
+            !g.try_claim(user, t0 + REPAIR_COOLDOWN + Duration::from_millis(1)),
+            "after a no-op repair the standard cooldown must not re-admit a claim"
+        );
+        assert!(
+            g.try_claim(user, t0 + REPAIR_NOOP_COOLDOWN + Duration::from_millis(1)),
+            "after the longer no-op cooldown a fresh claim must be admitted"
+        );
+    }
+}

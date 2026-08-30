@@ -1,0 +1,18 @@
+diff --git a/dist/client/mainthread/createIFrameRealm.js b/dist/client/mainthread/createIFrameRealm.js
+index 0000000..0000001 100644
+--- a/dist/client/mainthread/createIFrameRealm.js
++++ b/dist/client/mainthread/createIFrameRealm.js
+@@ -13,10 +13,4 @@ export async function createIFrameRealm(parent) {
+     const iframe = document.createElement('iframe');
+-    const iframeReadyPromise = new Promise((resolve) => {
+-        const listener = (event) => {
+-            if (event.data === 'lynx:mtsready' && event.source === iframe.contentWindow) {
+-                resolve();
+-                globalThis.removeEventListener('message', listener);
+-            }
+-        };
+-        globalThis.addEventListener('message', listener);
+-    });
++    const iframeReadyPromise = new Promise((resolve) => {
++        iframe.addEventListener('load', resolve, { once: true });
++    });

@@ -1,0 +1,20 @@
+{
+  "name": "@netslum/contracts",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": { ".": "./src/index.ts", "./lexicon": "./generated/types/sh/macha/netslumSite.ts" },
+  "scripts": {
+    "build": "tsc -b",
+    "lex:generate": "lex gen-api --yes ./generated ./lexicons/sh/macha/netslumSite.json",
+    "lex:check": "lex gen-api --yes ./generated.tmp ./lexicons/sh/macha/netslumSite.json && diff -ru ./generated ./generated.tmp && rm -rf ./generated.tmp",
+    "lex:lint": "lex gen-api --yes ./generated.tmp ./lexicons/sh/macha/netslumSite.json && rm -rf ./generated.tmp"
+  },
+  "dependencies": {
+    "@atproto/lexicon": "0.7.12",
+    "@atproto/xrpc": "0.8.11",
+    "multiformats": "13.4.2",
+    "zod": "4.4.3"
+  },
+  "devDependencies": { "@atproto/lex-cli": "0.10.11" }
+}

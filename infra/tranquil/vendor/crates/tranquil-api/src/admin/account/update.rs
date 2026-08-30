@@ -1,0 +1,199 @@
+use axum::{Json, extract::State};
+use serde::Deserialize;
+use tracing::{error, info, warn};
+use tranquil_pds::api::EmptyResponse;
+use tranquil_pds::api::error::ApiError;
+use tranquil_pds::auth::{Admin, Auth};
+use tranquil_pds::state::AppState;
+use tranquil_pds::types::{Did, Handle, PlainPassword};
+
+#[derive(Deserialize)]
+pub struct UpdateAccountEmailInput {
+    pub account: String,
+    pub email: String,
+}
+
+pub async fn update_account_email(
+    State(state): State<AppState>,
+    _auth: Auth<Admin>,
+    Json(input): Json<UpdateAccountEmailInput>,
+) -> Result<Json<EmptyResponse>, ApiError> {
+    let account = input.account.trim();
+    let email = input.email.trim();
+    if account.is_empty() || email.is_empty() {
+        return Err(ApiError::InvalidRequest(
+            "account and email are required".into(),
+        ));
+    }
+    let account_did: Did = account
+        .parse()
+        .map_err(|_| ApiError::InvalidDid("Invalid DID format".into()))?;
+
+    match state
+        .repos
+        .user
+        .admin_update_email(&account_did, email)
+        .await
+    {
+        Ok(0) => Err(ApiError::AccountNotFound),
+        Ok(_) => Ok(Json(EmptyResponse {})),
+        Err(e) => {
+            error!("DB error updating email: {:?}", e);
+            Err(ApiError::InternalError(None))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UpdateAccountHandleInput {
+    pub did: Did,
+    pub handle: String,
+}
+
+pub async fn update_account_handle(
+    State(state): State<AppState>,
+    _auth: Auth<Admin>,
+    Json(input): Json<UpdateAccountHandleInput>,
+) -> Result<Json<EmptyResponse>, ApiError> {
+    let did = &input.did;
+    let input_handle = input.handle.trim();
+    if input_handle.is_empty() {
+        return Err(ApiError::InvalidRequest("handle is required".into()));
+    }
+    if !input_handle
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return Err(ApiError::InvalidHandle(None));
+    }
+    let available_domains = tranquil_config::get().server.available_user_domain_list();
+    let handle = if !input_handle.contains('.') {
+        format!("{}.{}", input_handle, &available_domains[0])
+    } else {
+        input_handle.to_string()
+    };
+    let old_handle = state.repos.user.get_handle_by_did(did).await.ok().flatten();
+    let user_id = state
+        .repos
+        .user
+        .get_id_by_did(did)
+        .await
+        .ok()
+        .flatten()
+        .ok_or(ApiError::AccountNotFound)?;
+    let handle_for_check: Handle = handle.parse().map_err(|_| ApiError::InvalidHandle(None))?;
+    if let Ok(true) = state
+        .repos
+        .user
+        .check_handle_exists(&handle_for_check, user_id)
+        .await
+    {
+        return Err(ApiError::HandleTaken);
+    }
+    match state
+        .repos
+        .user
+        .admin_update_handle(did, &handle_for_check)
+        .await
+    {
+        Ok(0) => Err(ApiError::AccountNotFound),
+        Ok(_) => {
+            if let Some(old) = old_handle {
+                let _ = state
+                    .cache
+                    .delete(&tranquil_pds::cache_keys::handle_key(&old))
+                    .await;
+            }
+            let _ = state
+                .cache
+                .delete(&tranquil_pds::cache_keys::handle_key(&handle_for_check))
+                .await;
+            if let Err(e) = tranquil_pds::repo_ops::sequence_identity_event(
+                &state,
+                did,
+                Some(&handle_for_check),
+            )
+            .await
+            {
+                warn!(
+                    "Failed to sequence identity event for admin handle update: {}",
+                    e
+                );
+            }
+            if let Err(e) =
+                crate::identity::did::update_plc_handle(&state, did, &handle_for_check).await
+            {
+                warn!("Failed to update PLC handle for admin handle update: {}", e);
+            }
+            Ok(Json(EmptyResponse {}))
+        }
+        Err(e) => {
+            error!("DB error updating handle: {:?}", e);
+            Err(ApiError::InternalError(None))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UpdateAccountPasswordInput {
+    pub did: Did,
+    pub password: PlainPassword,
+}
+
+pub async fn update_account_password(
+    State(state): State<AppState>,
+    _auth: Auth<Admin>,
+    Json(input): Json<UpdateAccountPasswordInput>,
+) -> Result<Json<EmptyResponse>, ApiError> {
+    let did = &input.did;
+    let password = input.password.trim();
+    if password.is_empty() {
+        return Err(ApiError::InvalidRequest("password is required".into()));
+    }
+    let password_hash = crate::common::hash_or_internal_error(password)?;
+
+    match state
+        .repos
+        .user
+        .admin_update_password(did, &password_hash)
+        .await
+    {
+        Ok(0) => Err(ApiError::AccountNotFound),
+        Ok(_) => Ok(Json(EmptyResponse {})),
+        Err(e) => {
+            error!("DB error updating password: {:?}", e);
+            Err(ApiError::InternalError(None))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SetAdminStatusInput {
+    pub did: Did,
+    pub admin: bool,
+}
+
+pub async fn set_admin_status(
+    State(state): State<AppState>,
+    auth: Auth<Admin>,
+    Json(input): Json<SetAdminStatusInput>,
+) -> Result<Json<EmptyResponse>, ApiError> {
+    info!(
+        actor = %auth.did,
+        target = %input.did,
+        admin = input.admin,
+        "admin status change"
+    );
+
+    state
+        .repos
+        .user
+        .set_admin_status(&input.did, input.admin)
+        .await
+        .map_err(|e| {
+            error!("DB error setting admin status: {:?}", e);
+            ApiError::InternalError(None)
+        })?;
+
+    Ok(Json(EmptyResponse {}))
+}

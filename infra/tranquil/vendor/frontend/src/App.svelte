@@ -1,0 +1,144 @@
+<script lang="ts">
+  import { getCurrentPath, navigate } from './lib/router.svelte'
+  import { initAuth, getAuthState } from './lib/auth.svelte'
+  import { initServerConfig } from './lib/serverConfig.svelte'
+  import { initI18n } from './lib/i18n'
+  import { isLoading as i18nLoading } from 'svelte-i18n'
+  import Toast from './components/Toast.svelte'
+  import Login from './routes/Login.svelte'
+  import RegisterSso from './routes/RegisterSso.svelte'
+  import Verify from './routes/Verify.svelte'
+  import ResetPassword from './routes/ResetPassword.svelte'
+  import RecoverPasskey from './routes/RecoverPasskey.svelte'
+  import RequestPasskeyRecovery from './routes/RequestPasskeyRecovery.svelte'
+  import Dashboard from './routes/Dashboard.svelte'
+  import OAuthConsent from './routes/OAuthConsent.svelte'
+  import OAuthLogin from './routes/OAuthLogin.svelte'
+  import OAuthAccounts from './routes/OAuthAccounts.svelte'
+  import OAuthVerifyCode from './routes/OAuthVerifyCode.svelte'
+  import OAuthPasskey from './routes/OAuthPasskey.svelte'
+  import OAuthDelegation from './routes/OAuthDelegation.svelte'
+  import OAuthError from './routes/OAuthError.svelte'
+  import SsoRegisterComplete from './routes/SsoRegisterComplete.svelte'
+  import Register from './routes/Register.svelte'
+
+  import ActAs from './routes/ActAs.svelte'
+  import Migration from './routes/Migration.svelte'
+  import { _ } from './lib/i18n'
+  initI18n()
+
+  const auth = $derived(getAuthState())
+
+  let oauthCallbackPending = $state(hasOAuthCallback())
+
+  function hasOAuthCallback(): boolean {
+    if (window.location.pathname === '/app/migrate') {
+      return false
+    }
+    const params = new URLSearchParams(window.location.search)
+    return !!(params.get('code') && params.get('state'))
+  }
+
+  $effect(() => {
+    initServerConfig()
+    initAuth().then(({ oauthLoginCompleted }) => {
+      if (oauthLoginCompleted) {
+        navigate('/dashboard', { replace: true })
+      }
+      oauthCallbackPending = false
+    })
+  })
+
+  const isLoading = $derived(
+    auth.kind === 'loading' || $i18nLoading || oauthCallbackPending
+  )
+
+  $effect(() => {
+    if (auth.kind === 'loading') return
+    const path = getCurrentPath()
+    if (path === '/') {
+      if (auth.kind === 'authenticated') {
+        navigate('/dashboard', { replace: true })
+      } else {
+        navigate('/login', { replace: true })
+      }
+    }
+  })
+
+  const dashboardRoutes = new Set([
+    '/dashboard',
+    '/settings',
+    '/security',
+    '/sessions',
+    '/app-passwords',
+    '/comms',
+    '/repo',
+    '/controllers',
+
+    '/invite-codes',
+    '/did-document',
+    '/admin',
+    '/about',
+  ])
+
+  function getComponent(path: string) {
+    const pathWithoutQuery = path.split('?')[0]
+    if (dashboardRoutes.has(pathWithoutQuery)) {
+      return Dashboard
+    }
+    switch (pathWithoutQuery) {
+      case '/login':
+        return Login
+      case '/verify':
+        return Verify
+      case '/reset-password':
+        return ResetPassword
+      case '/recover-passkey':
+        return RecoverPasskey
+      case '/request-passkey-recovery':
+        return RequestPasskeyRecovery
+      case '/oauth/consent':
+        return OAuthConsent
+      case '/oauth/login':
+        return OAuthLogin
+      case '/oauth/accounts':
+        return OAuthAccounts
+      case '/oauth/2fa':
+      case '/oauth/totp':
+        return OAuthVerifyCode
+      case '/oauth/passkey':
+        return OAuthPasskey
+      case '/oauth/delegation':
+        return OAuthDelegation
+      case '/oauth/error':
+        return OAuthError
+      case '/oauth/sso-register':
+        return SsoRegisterComplete
+      case '/register':
+      case '/oauth/register':
+      case '/oauth/register-password':
+        return Register
+      case '/oauth/register-sso':
+        return RegisterSso
+      case '/act-as':
+        return ActAs
+      case '/migrate':
+        return Migration
+      default:
+        return Login
+    }
+  }
+
+  let currentPath = $derived(getCurrentPath())
+  let CurrentComponent = $derived(getComponent(currentPath))
+
+</script>
+
+<main>
+  {#if isLoading}
+    <div class="loading"></div>
+  {:else}
+    <CurrentComponent />
+  {/if}
+</main>
+<Toast />

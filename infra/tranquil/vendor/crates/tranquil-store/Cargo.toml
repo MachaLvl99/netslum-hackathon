@@ -1,0 +1,95 @@
+[package]
+name = "tranquil-store"
+description = "Embedded storage engine for tranquil-pds (experimental)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+serde = { workspace = true }
+postcard = { version = "1", features = ["alloc"] }
+parking_lot = { workspace = true }
+fjall = "3"
+lsm-tree = "3"
+flume = "0.11"
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
+bytes = "1"
+memmap2 = "0.9"
+tracing = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tranquil-db-traits = { workspace = true }
+tranquil-oauth = { workspace = true }
+tranquil-types = { workspace = true }
+jacquard-repo = { workspace = true }
+cid = { workspace = true }
+multihash = { workspace = true }
+sha2 = { workspace = true }
+serde_ipld_dagcbor = { workspace = true }
+siphasher = "1"
+dashmap = "6"
+rayon = "1"
+smallvec = "1"
+uuid = { workspace = true }
+tempfile = { version = "3", optional = true }
+clap = { workspace = true, optional = true }
+toml = { version = "0.8", optional = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"], optional = true }
+tikv-jemallocator = { version = "0.6", optional = true }
+libc = "0.2"
+
+[features]
+test-harness = ["dep:tempfile"]
+jemalloc = ["dep:tikv-jemallocator"]
+gauntlet-cli = ["test-harness", "dep:clap", "dep:toml", "dep:tracing-subscriber", "jemalloc"]
+gauntlet-jemalloc-prof = []
+
+[[bin]]
+name = "tranquil-gauntlet"
+path = "src/bin/tranquil_gauntlet.rs"
+required-features = ["gauntlet-cli"]
+
+[dev-dependencies]
+tranquil-store = { path = ".", features = ["test-harness"] }
+proptest = "1"
+tempfile = "3"
+futures = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros", "time"] }
+jacquard-common = { workspace = true }
+tranquil-db = { workspace = true, features = [ "postgres" ] }
+sqlx = { workspace = true }
+k256 = { workspace = true }
+rand = { workspace = true }
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[[bench]]
+name = "blockstore"
+harness = false
+
+[[bench]]
+name = "eventlog"
+harness = false
+
+[[bench]]
+name = "metastore"
+harness = false
+
+[[bench]]
+name = "metastore_scale"
+harness = false
+
+[[bench]]
+name = "profile_reads"
+harness = false
+
+[[bench]]
+name = "profile_eventlog_reads"
+harness = false
+
+[[bench]]
+name = "recovery"
+harness = false

@@ -1,0 +1,149 @@
+use smallvec::SmallVec;
+
+use super::encoding::KeyBuilder;
+use super::keys::{KeyTag, UserHash};
+use tranquil_types::Tid;
+
+pub fn rev_to_seq_key(user_hash: UserHash, rev: &Tid) -> SmallVec<[u8; 128]> {
+    KeyBuilder::new()
+        .tag(KeyTag::REV_TO_SEQ)
+        .u64(user_hash.raw())
+        .string(rev)
+        .build()
+}
+
+pub fn rev_to_seq_user_prefix(user_hash: UserHash) -> SmallVec<[u8; 128]> {
+    KeyBuilder::new()
+        .tag(KeyTag::REV_TO_SEQ)
+        .u64(user_hash.raw())
+        .build()
+}
+
+pub fn seq_tombstone_key(seq: u64) -> SmallVec<[u8; 128]> {
+    KeyBuilder::new()
+        .tag(KeyTag::SEQ_TOMBSTONE)
+        .u64(seq)
+        .build()
+}
+
+pub fn did_events_key(user_hash: UserHash, seq: u64) -> SmallVec<[u8; 128]> {
+    KeyBuilder::new()
+        .tag(KeyTag::DID_EVENTS)
+        .u64(user_hash.raw())
+        .u64(seq)
+        .build()
+}
+
+pub fn did_events_prefix(user_hash: UserHash) -> SmallVec<[u8; 128]> {
+    KeyBuilder::new()
+        .tag(KeyTag::DID_EVENTS)
+        .u64(user_hash.raw())
+        .build()
+}
+
+pub fn metastore_cursor_key() -> SmallVec<[u8; 128]> {
+    KeyBuilder::new()
+        .tag(KeyTag::METASTORE_CURSOR)
+        .raw(&[0x00])
+        .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metastore::encoding::KeyReader;
+
+    fn test_rev(seq: u64) -> Tid {
+        const ALPHABET: &[u8] = b"234567abcdefghijklmnopqrstuvwxyz";
+        let s: String = (0..13)
+            .rev()
+            .map(|i| ALPHABET[((seq >> (i * 5)) & 0x1F) as usize] as char)
+            .collect();
+        Tid::new(s).expect("generated TID is valid")
+    }
+
+    #[test]
+    fn rev_to_seq_key_roundtrip() {
+        let hash = UserHash::from_raw(0xDEAD_BEEF_CAFE_BABE);
+        let rev = test_rev(10);
+        let key = rev_to_seq_key(hash, &rev);
+        let mut reader = KeyReader::new(&key);
+        assert_eq!(reader.tag(), Some(KeyTag::REV_TO_SEQ.raw()));
+        assert_eq!(reader.u64(), Some(0xDEAD_BEEF_CAFE_BABE));
+        assert_eq!(reader.string(), Some(rev.as_str().to_owned()));
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn rev_to_seq_keys_sort_by_user_then_rev() {
+        let h1 = UserHash::from_raw(1);
+        let h2 = UserHash::from_raw(2);
+        let k1 = rev_to_seq_key(h1, &test_rev(10));
+        let k2 = rev_to_seq_key(h1, &test_rev(20));
+        let k3 = rev_to_seq_key(h2, &test_rev(10));
+        assert!(k1.as_slice() < k2.as_slice());
+        assert!(k2.as_slice() < k3.as_slice());
+    }
+
+    #[test]
+    fn rev_to_seq_user_prefix_is_prefix_of_full_key() {
+        let hash = UserHash::from_raw(42);
+        let prefix = rev_to_seq_user_prefix(hash);
+        let full = rev_to_seq_key(hash, &test_rev(10));
+        assert!(full.as_slice().starts_with(prefix.as_slice()));
+    }
+
+    #[test]
+    fn seq_tombstone_key_roundtrip() {
+        let key = seq_tombstone_key(999);
+        let mut reader = KeyReader::new(&key);
+        assert_eq!(reader.tag(), Some(KeyTag::SEQ_TOMBSTONE.raw()));
+        assert_eq!(reader.u64(), Some(999));
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn did_events_key_roundtrip() {
+        let hash = UserHash::from_raw(0xCAFE_BABE_DEAD_BEEF);
+        let key = did_events_key(hash, 42);
+        let mut reader = KeyReader::new(&key);
+        assert_eq!(reader.tag(), Some(KeyTag::DID_EVENTS.raw()));
+        assert_eq!(reader.u64(), Some(0xCAFE_BABE_DEAD_BEEF));
+        assert_eq!(reader.u64(), Some(42));
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn did_events_keys_sort_by_user_then_seq() {
+        let h1 = UserHash::from_raw(1);
+        let h2 = UserHash::from_raw(2);
+        let k1 = did_events_key(h1, 10);
+        let k2 = did_events_key(h1, 20);
+        let k3 = did_events_key(h2, 5);
+        assert!(k1.as_slice() < k2.as_slice());
+        assert!(k2.as_slice() < k3.as_slice());
+    }
+
+    #[test]
+    fn did_events_prefix_is_prefix_of_full_key() {
+        let hash = UserHash::from_raw(99);
+        let prefix = did_events_prefix(hash);
+        let full = did_events_key(hash, 1);
+        assert!(full.as_slice().starts_with(prefix.as_slice()));
+    }
+
+    #[test]
+    fn metastore_cursor_key_roundtrip() {
+        let key = metastore_cursor_key();
+        let mut reader = KeyReader::new(&key);
+        assert_eq!(reader.tag(), Some(KeyTag::METASTORE_CURSOR.raw()));
+        assert_eq!(reader.remaining(), &[0x00]);
+    }
+
+    #[test]
+    fn metastore_cursor_key_is_stable() {
+        let k1 = metastore_cursor_key();
+        let k2 = metastore_cursor_key();
+        assert_eq!(k1.as_slice(), k2.as_slice());
+    }
+}

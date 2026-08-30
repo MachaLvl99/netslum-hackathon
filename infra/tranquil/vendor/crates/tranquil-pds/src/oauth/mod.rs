@@ -1,0 +1,28 @@
+pub mod client;
+pub mod db;
+pub mod permission_set_resolver;
+pub mod scopes;
+pub mod verify;
+
+pub fn db_err_to_oauth(err: tranquil_db_traits::DbError) -> OAuthError {
+    tracing::error!("Database error in OAuth flow: {}", err);
+    OAuthError::ServerError("An internal error occurred".to_string())
+}
+
+pub use tranquil_oauth::{
+    AuthFlow, AuthFlowWithUser, AuthorizationCode, AuthorizationRequestParameters,
+    AuthorizationServerMetadata, AuthorizedClientData, ClientAuth, ClientMetadata,
+    ClientMetadataCache, CodeChallengeMethod, DPoPJwk, DPoPProofHeader, DPoPProofPayload,
+    DPoPVerifier, DPoPVerifyResult, DeviceData, DeviceId, FlowAuthenticated, FlowAuthorized,
+    FlowExpired, FlowNotAuthenticated, FlowNotAuthorized, FlowPending, JwkPublicKey, Jwks,
+    OAuthClientMetadata, OAuthError, ParResponse, Prompt, ProtectedResourceMetadata, RefreshToken,
+    RefreshTokenState, RequestData, RequestId, ResponseMode, ResponseType, SessionId, TokenData,
+    TokenId, TokenRequest, TokenResponse, compute_access_token_hash, compute_jwk_thumbprint,
+    compute_pkce_challenge, verify_client_auth,
+};
+
+pub use permission_set_resolver::expand_scopes;
+pub use scopes::{AccountAction, AccountAttr, RepoAction, ScopeError, ScopePermissions};
+pub use verify::{
+    OAuthAuthError, OAuthUser, VerifyResult, generate_dpop_nonce, verify_oauth_access_token,
+};

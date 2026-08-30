@@ -1,0 +1,26 @@
+[package]
+name = "tranquil-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tranquil-config = { workspace = true }
+tranquil-crypto = { workspace = true }
+tranquil-types = { path = "../tranquil-types", default-features = false }
+
+anyhow = { workspace = true }
+base32 = { workspace = true }
+base64 = { workspace = true }
+bcrypt = { workspace = true }
+chrono = { workspace = true }
+hmac = { workspace = true }
+k256 = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+totp-rs = { workspace = true }
+urlencoding = { workspace = true }
+uuid = { workspace = true }

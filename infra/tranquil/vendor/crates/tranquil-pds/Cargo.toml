@@ -1,0 +1,104 @@
+[package]
+name = "tranquil-pds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tranquil-types = { workspace = true }
+tranquil-config = { workspace = true }
+tranquil-storage = { workspace = true }
+tranquil-cache = { workspace = true }
+tranquil-repo = { workspace = true }
+tranquil-scopes = { workspace = true }
+tranquil-auth = { workspace = true }
+tranquil-oauth = { workspace = true }
+tranquil-comms = { workspace = true }
+tranquil-signal = { workspace = true }
+tranquil-db = { workspace = true }
+tranquil-db-traits = { workspace = true }
+tranquil-store = { workspace = true }
+tranquil-lexicon = { workspace = true, features = ["resolve"] }
+
+aes-gcm = { workspace = true }
+async-trait = { workspace = true }
+backon = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+base32 = { workspace = true }
+base64 = { workspace = true }
+bcrypt = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+cid = { workspace = true }
+ed25519-dalek = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+governor = { workspace = true }
+hickory-resolver = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+http = { workspace = true }
+image = { workspace = true }
+ipld-core = { workspace = true }
+iroh-car = { workspace = true }
+jacquard-common = { workspace = true }
+jacquard-repo = { workspace = true }
+jsonwebtoken = { workspace = true }
+k256 = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+multibase = { workspace = true }
+multihash = { workspace = true }
+p256 = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+serde_ipld_dagcbor = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tower-layer = { workspace = true }
+tracing = { workspace = true }
+urlencoding = { workspace = true }
+uuid = { workspace = true }
+webauthn-rs = { workspace = true }
+webauthn-rs-proto = { workspace = true }
+
+[features]
+bsky = ["bsky-support"]
+bsky-support = []
+external-infra = []
+postgres = ["tranquil-db/postgres"]
+s3 = ["tranquil-storage/s3"]
+valkey = ["tranquil-cache/valkey"]
+frontend = []
+native-tls-roots = ["tranquil-oauth/native-tls-roots"]
+
+[dev-dependencies]
+tempfile = "3"
+ciborium = { workspace = true }
+ctor = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+tranquil-ripple = { workspace = true }
+tranquil-sync = { workspace = true }
+tranquil-api = { workspace = true }
+tranquil-oauth-server = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+wiremock = { workspace = true }
+hex = { workspace = true }
+tokio-tungstenite = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+redis = { workspace = true }

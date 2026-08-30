@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) as \"count!\" FROM comms_queue WHERE user_id = $1 AND comms_type = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        {
+          "Custom": {
+            "name": "comms_type",
+            "kind": {
+              "Enum": [
+                "welcome",
+                "email_verification",
+                "password_reset",
+                "email_update",
+                "account_deletion",
+                "admin_email",
+                "plc_operation",
+                "two_factor_code",
+                "channel_verification",
+                "passkey_recovery",
+                "legacy_login_alert",
+                "migration_verification",
+                "channel_verified"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "b364a2b202bab17c0cdc5f70d23b13841b4d9063d94cd0b09268c3dc41824fd2"
+}

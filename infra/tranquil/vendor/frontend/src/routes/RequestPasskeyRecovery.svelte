@@ -1,0 +1,78 @@
+<script lang="ts">
+  import { navigate, routes, getFullUrl } from '../lib/router.svelte'
+  import { api, ApiError } from '../lib/api'
+  import { _ } from '../lib/i18n'
+  import { unsafeAsEmail } from '../lib/types/branded'
+
+  let identifier = $state('')
+  let submitting = $state(false)
+  let error = $state<string | null>(null)
+  let success = $state(false)
+
+  async function handleSubmit(e: Event) {
+    e.preventDefault()
+    submitting = true
+    error = null
+
+    try {
+      await api.requestPasskeyRecovery(unsafeAsEmail(identifier))
+      success = true
+    } catch (err) {
+      if (err instanceof ApiError) {
+        error = err.message || 'Failed to send recovery link'
+      } else if (err instanceof Error) {
+        error = err.message || 'Failed to send recovery link'
+      } else {
+        error = 'Failed to send recovery link'
+      }
+    } finally {
+      submitting = false
+    }
+  }
+</script>
+
+<div class="recovery-page">
+  {#if success}
+    <div class="success-content">
+      <h1>{$_('requestPasskeyRecovery.successTitle')}</h1>
+      <p class="subtitle">{$_('requestPasskeyRecovery.successMessage')}</p>
+      <p class="info-text">{$_('requestPasskeyRecovery.successInfo')}</p>
+      <button onclick={() => navigate(routes.login)}>{$_('common.backToLogin')}</button>
+    </div>
+  {:else}
+    <h1>{$_('requestPasskeyRecovery.title')}</h1>
+    <p class="subtitle">{$_('requestPasskeyRecovery.subtitle')}</p>
+
+    {#if error}
+      <div class="message error">{error}</div>
+    {/if}
+
+    <form onsubmit={handleSubmit}>
+      <div>
+        <label for="identifier">{$_('requestPasskeyRecovery.handleOrEmail')}</label>
+        <input
+          id="identifier"
+          type="text"
+          bind:value={identifier}
+          placeholder={$_('requestPasskeyRecovery.emailPlaceholder')}
+          disabled={submitting}
+          required
+        />
+      </div>
+
+      <div class="info-box">
+        <strong>{$_('requestPasskeyRecovery.howItWorks')}</strong>
+        <p>{$_('requestPasskeyRecovery.howItWorksDetail')}</p>
+      </div>
+
+      <button type="submit" disabled={submitting || !identifier.trim()}>
+        {submitting ? $_('requestPasskeyRecovery.sending') : $_('requestPasskeyRecovery.sendRecoveryLink')}
+      </button>
+    </form>
+  {/if}
+
+  <p class="link-text">
+    <a href={getFullUrl(routes.login)}>{$_('common.backToLogin')}</a>
+  </p>
+</div>
+

@@ -1,0 +1,18 @@
+[Unit]
+Description=Tranquil PDS valkey cache
+[Container]
+ContainerName=tranquil-pds-valkey
+Image=docker.io/valkey/valkey:9-alpine
+Pod=tranquil-pds.pod
+Volume=/srv/tranquil-pds/valkey:/data:Z
+Exec=valkey-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+HealthCmd=valkey-cli ping
+HealthInterval=10s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=5s
+[Service]
+Restart=always
+RestartSec=10
+[Install]
+WantedBy=default.target

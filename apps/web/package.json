@@ -1,0 +1,27 @@
+{
+  "name": "@netslum/web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @netslum/lynx build && wrangler dev --port 8787 --inspector-port 9229 --persist-to ../../.wrangler/state",
+    "build": "pnpm --filter @netslum/lynx build && wrangler deploy --dry-run --outdir dist",
+    "preview": "pnpm --filter @netslum/lynx build && wrangler dev --port 8787 --inspector-port 9229 --persist-to ../../.wrangler/state",
+    "deploy": "pnpm --filter @netslum/lynx build && wrangler deploy",
+    "wrangler:types": "wrangler types --config wrangler.jsonc env.d.ts",
+    "db:migrate:local": "wrangler d1 migrations apply netslum --local --persist-to ../../.wrangler/state"
+  },
+  "dependencies": {
+    "@atproto/api": "0.20.42",
+    "@atproto/oauth-client-node": "0.5.4",
+    "@netslum/contracts": "workspace:*",
+    "@netslum/sandbox": "workspace:*",
+    "hono": "4.13.5",
+    "webmcp-types": "0.1.5",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260827.1",
+    "wrangler": "4.127.0"
+  }
+}

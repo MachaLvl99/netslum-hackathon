@@ -1,0 +1,465 @@
+use super::validation::validate_record_with_status;
+use super::validation_mode::{ValidationMode, deserialize_validation_mode};
+use axum::{Json, extract::State};
+use cid::Cid;
+use jacquard_repo::storage::BlockStore;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::borrow::Cow;
+use std::str::FromStr;
+use tracing::warn;
+use tranquil_pds::api::error::{ApiError, DbResultExt};
+use tranquil_pds::auth::{
+    Active, Auth, AuthSource, RepoScopeAction, ScopeVerified, VerifyScope, require_not_migrated,
+    require_verified_or_delegated,
+};
+use tranquil_pds::repo_ops::{
+    FinalizeParams, RecordOp, begin_repo_write, extract_backlinks, extract_blob_cids,
+    finalize_repo_write, with_repair_retry,
+};
+use tranquil_pds::state::AppState;
+use tranquil_pds::types::{AtIdentifier, AtUri, Did, Nsid, Rkey, Tid};
+use tranquil_pds::validation::ValidationStatus;
+use uuid::Uuid;
+
+pub struct RepoWriteAuth {
+    pub did: Did,
+    pub user_id: Uuid,
+    pub auth_source: AuthSource,
+    pub scope: Option<String>,
+    pub controller_did: Option<Did>,
+}
+
+pub async fn prepare_repo_write<A: RepoScopeAction>(
+    state: &AppState,
+    scope_proof: &ScopeVerified<'_, A>,
+    repo: &AtIdentifier,
+) -> Result<RepoWriteAuth, ApiError> {
+    let user = scope_proof.user();
+    let principal_did = scope_proof.principal_did();
+    if repo.as_str() != principal_did.as_str() {
+        return Err(ApiError::InvalidRepo(
+            "Repo does not match authenticated user".into(),
+        ));
+    }
+
+    require_not_migrated(state, principal_did.as_did()).await?;
+    let _account_verified = require_verified_or_delegated(state, user).await?;
+
+    let user_id = state
+        .repos
+        .user
+        .get_id_by_did(principal_did.as_did())
+        .await
+        .log_db_err("fetching user for repo write")?
+        .ok_or(ApiError::InternalError(Some("User not found".into())))?;
+
+    Ok(RepoWriteAuth {
+        did: principal_did.into_did(),
+        user_id,
+        auth_source: user.auth_source.clone(),
+        scope: user.scope.clone(),
+        controller_did: scope_proof.controller_did().map(|c| c.into_did()),
+    })
+}
+
+pub(crate) fn ensure_record_type<'a>(
+    record: &'a serde_json::Value,
+    collection: &Nsid,
+) -> Cow<'a, serde_json::Value> {
+    let serde_json::Value::Object(map) = record else {
+        return Cow::Borrowed(record);
+    };
+    let needs_fill = match map.get("$type") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(existing)) => existing.is_empty(),
+        Some(_) => false,
+    };
+    if !needs_fill {
+        return Cow::Borrowed(record);
+    }
+    let mut map = map.clone();
+    map.insert(
+        "$type".to_string(),
+        serde_json::Value::String(collection.to_string()),
+    );
+    Cow::Owned(serde_json::Value::Object(map))
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+pub struct CreateRecordInput {
+    pub repo: AtIdentifier,
+    pub collection: Nsid,
+    pub rkey: Option<Rkey>,
+    #[serde(default, deserialize_with = "deserialize_validation_mode")]
+    pub validate: ValidationMode,
+    pub record: serde_json::Value,
+    #[serde(rename = "swapCommit")]
+    pub swap_commit: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitInfo {
+    pub cid: String,
+    pub rev: Tid,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateRecordOutput {
+    pub uri: AtUri,
+    pub cid: String,
+    pub commit: CommitInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_status: Option<ValidationStatus>,
+}
+
+pub async fn create_record(
+    State(state): State<AppState>,
+    auth: Auth<Active>,
+    Json(mut input): Json<CreateRecordInput>,
+) -> Result<Json<CreateRecordOutput>, ApiError> {
+    if let Cow::Owned(record) = ensure_record_type(&input.record, &input.collection) {
+        input.record = record;
+    }
+    let scope_proof = auth.verify_repo_create(&input.collection)?;
+    let repo_auth = prepare_repo_write(&state, &scope_proof, &input.repo).await?;
+    let did = repo_auth.did;
+    let user_id = repo_auth.user_id;
+    let controller_did = repo_auth.controller_did;
+
+    let out = with_repair_retry(&state, user_id, || {
+        create_record_inner(&state, &did, user_id, controller_did.as_ref(), &input)
+    })
+    .await?;
+    Ok(Json(out))
+}
+
+async fn create_record_inner(
+    state: &AppState,
+    did: &Did,
+    user_id: Uuid,
+    controller_did: Option<&Did>,
+    input: &CreateRecordInput,
+) -> Result<CreateRecordOutput, ApiError> {
+    let (ctx, mut mst) = begin_repo_write(state, user_id, input.swap_commit.as_deref()).await?;
+
+    let validation_status = if input.validate.should_skip() {
+        None
+    } else {
+        Some(
+            validate_record_with_status(
+                &input.record,
+                &input.collection,
+                input.rkey.as_ref(),
+                input.validate.requires_lexicon(),
+            )
+            .await?,
+        )
+    };
+
+    let rkey = input.rkey.clone().unwrap_or_else(Rkey::generate);
+    let mut ops: Vec<RecordOp> = Vec::new();
+    let mut conflict_uris_to_cleanup: Vec<AtUri> = Vec::new();
+
+    if !input.validate.should_skip() {
+        let record_uri = AtUri::from_parts(did, &input.collection, &rkey);
+        let backlinks = extract_backlinks(&record_uri, &input.record);
+
+        if !backlinks.is_empty() {
+            let conflicts = state
+                .repos
+                .backlink
+                .get_backlink_conflicts(user_id, &input.collection, &backlinks)
+                .await
+                .log_db_err("checking backlink conflicts")?;
+
+            for conflict_uri in conflicts {
+                let (Some(conflict_rkey_str), Some(conflict_col_str)) =
+                    (conflict_uri.rkey(), conflict_uri.collection())
+                else {
+                    continue;
+                };
+                let (Ok(conflict_rkey), Ok(conflict_collection)) =
+                    (Rkey::new(conflict_rkey_str), Nsid::new(conflict_col_str))
+                else {
+                    warn!(
+                        uri = %conflict_uri,
+                        "skipping a backlink conflict whose stored URI doesn't parse"
+                    );
+                    continue;
+                };
+                let conflict_key = format!("{}/{}", conflict_collection, conflict_rkey);
+
+                let prev_cid = match mst.get(&conflict_key).await {
+                    Ok(Some(cid)) => cid,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        return Err(ApiError::from_mst_error(
+                            &format!("read conflict record from MST {conflict_uri}"),
+                            &e,
+                        ));
+                    }
+                };
+
+                mst = mst.delete(&conflict_key).await.map_err(|e| {
+                    ApiError::from_mst_error(
+                        &format!("delete conflict from MST {conflict_uri}"),
+                        &e,
+                    )
+                })?;
+
+                ops.push(RecordOp::Delete {
+                    collection: conflict_collection,
+                    rkey: conflict_rkey,
+                    prev: tranquil_pds::cid_types::RecordCid::from(prev_cid),
+                });
+                conflict_uris_to_cleanup.push(conflict_uri);
+            }
+        }
+    }
+
+    let key = format!("{}/{}", input.collection, rkey);
+    if mst
+        .get(&key)
+        .await
+        .map_err(|e| ApiError::from_mst_error("read MST for create existence check", &e))?
+        .is_some()
+    {
+        return Err(ApiError::InvalidRequest(format!(
+            "Record already exists at {key}"
+        )));
+    }
+
+    let record_ipld = tranquil_pds::util::json_to_ipld(&input.record);
+    let record_bytes = serde_ipld_dagcbor::to_vec(&record_ipld)
+        .map_err(|_| ApiError::InvalidRecord("Failed to serialize record".into()))?;
+    let record_cid = ctx
+        .tracking_store
+        .put(&record_bytes)
+        .await
+        .map_err(|_| ApiError::InternalError(Some("Failed to save record block".into())))?;
+    mst = mst
+        .add(&key, record_cid)
+        .await
+        .map_err(|e| ApiError::from_mst_error("add record to MST", &e))?;
+
+    ops.push(RecordOp::Create {
+        collection: input.collection.clone(),
+        rkey: rkey.clone(),
+        cid: tranquil_pds::cid_types::RecordCid::from(record_cid),
+    });
+
+    let blob_cids = extract_blob_cids(&input.record);
+
+    let created_uri = AtUri::from_parts(did, &input.collection, &rkey);
+    let backlinks_to_add = extract_backlinks(&created_uri, &input.record);
+
+    let commit_result = finalize_repo_write(
+        state,
+        ctx,
+        mst,
+        FinalizeParams {
+            did,
+            user_id,
+            controller_did,
+            delegation_detail: controller_did.map(|_| {
+                json!({
+                    "action": "create",
+                    "collection": input.collection,
+                    "rkey": rkey
+                })
+            }),
+            ops,
+            blob_cids: &blob_cids,
+            backlinks_to_add,
+            backlinks_to_remove: conflict_uris_to_cleanup,
+        },
+    )
+    .await?;
+
+    Ok(CreateRecordOutput {
+        uri: created_uri,
+        cid: record_cid.to_string(),
+        commit: CommitInfo {
+            cid: commit_result.commit_cid.to_string(),
+            rev: commit_result.rev,
+        },
+        validation_status,
+    })
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+pub struct PutRecordInput {
+    pub repo: AtIdentifier,
+    pub collection: Nsid,
+    pub rkey: Rkey,
+    #[serde(default, deserialize_with = "deserialize_validation_mode")]
+    pub validate: ValidationMode,
+    pub record: serde_json::Value,
+    #[serde(rename = "swapCommit")]
+    pub swap_commit: Option<String>,
+    #[serde(rename = "swapRecord")]
+    pub swap_record: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PutRecordOutput {
+    pub uri: AtUri,
+    pub cid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<CommitInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_status: Option<ValidationStatus>,
+}
+
+pub async fn put_record(
+    State(state): State<AppState>,
+    auth: Auth<Active>,
+    Json(mut input): Json<PutRecordInput>,
+) -> Result<Json<PutRecordOutput>, ApiError> {
+    if let Cow::Owned(record) = ensure_record_type(&input.record, &input.collection) {
+        input.record = record;
+    }
+    let upsert_proof = auth.verify_repo_upsert(&input.collection)?;
+    let repo_auth = prepare_repo_write(&state, &upsert_proof, &input.repo).await?;
+    let did = repo_auth.did;
+    let user_id = repo_auth.user_id;
+    let controller_did = repo_auth.controller_did;
+
+    let out = with_repair_retry(&state, user_id, || {
+        put_record_inner(&state, &did, user_id, controller_did.as_ref(), &input)
+    })
+    .await?;
+    Ok(Json(out))
+}
+
+async fn put_record_inner(
+    state: &AppState,
+    did: &Did,
+    user_id: Uuid,
+    controller_did: Option<&Did>,
+    input: &PutRecordInput,
+) -> Result<PutRecordOutput, ApiError> {
+    let (ctx, mst) = begin_repo_write(state, user_id, input.swap_commit.as_deref()).await?;
+
+    let validation_status = if input.validate.should_skip() {
+        None
+    } else {
+        Some(
+            validate_record_with_status(
+                &input.record,
+                &input.collection,
+                Some(&input.rkey),
+                input.validate.requires_lexicon(),
+            )
+            .await?,
+        )
+    };
+
+    let key = format!("{}/{}", input.collection, input.rkey);
+
+    let read_cid = |r: Result<Option<Cid>, jacquard_repo::error::RepoError>| {
+        r.map_err(|e| ApiError::from_mst_error("read MST for put", &e))
+    };
+
+    if let Some(swap_record_str) = &input.swap_record {
+        let expected_cid = Cid::from_str(swap_record_str).ok();
+        let actual_cid = read_cid(mst.get(&key).await)?;
+        if expected_cid != actual_cid {
+            return Err(ApiError::InvalidSwap(Some(
+                "Record has been modified or does not exist".into(),
+            )));
+        }
+    }
+
+    let existing_cid = read_cid(mst.get(&key).await)?;
+    let record_ipld = tranquil_pds::util::json_to_ipld(&input.record);
+    let record_bytes = serde_ipld_dagcbor::to_vec(&record_ipld)
+        .map_err(|_| ApiError::InvalidRecord("Failed to serialize record".into()))?;
+    let record_cid = jacquard_repo::mst::util::compute_cid(&record_bytes)
+        .map_err(|_| ApiError::InvalidRecord("Failed to compute record CID".into()))?;
+
+    if existing_cid == Some(record_cid) {
+        return Ok(PutRecordOutput {
+            uri: AtUri::from_parts(did, &input.collection, &input.rkey),
+            cid: record_cid.to_string(),
+            commit: None,
+            validation_status,
+        });
+    }
+
+    ctx.tracking_store
+        .put(&record_bytes)
+        .await
+        .map_err(|_| ApiError::InternalError(Some("Failed to save record block".into())))?;
+
+    let record_uri = AtUri::from_parts(did, &input.collection, &input.rkey);
+    let (new_mst, op, is_update, backlinks_to_remove) = match existing_cid {
+        Some(prev_cid) => {
+            let new_mst = mst
+                .update(&key, record_cid)
+                .await
+                .map_err(|e| ApiError::from_mst_error("update record in MST", &e))?;
+            let op = RecordOp::Update {
+                collection: input.collection.clone(),
+                rkey: input.rkey.clone(),
+                cid: tranquil_pds::cid_types::RecordCid::from(record_cid),
+                prev: tranquil_pds::cid_types::RecordCid::from(prev_cid),
+            };
+            (new_mst, op, true, vec![record_uri.clone()])
+        }
+        None => {
+            let new_mst = mst
+                .add(&key, record_cid)
+                .await
+                .map_err(|e| ApiError::from_mst_error("add record to MST", &e))?;
+            let op = RecordOp::Create {
+                collection: input.collection.clone(),
+                rkey: input.rkey.clone(),
+                cid: tranquil_pds::cid_types::RecordCid::from(record_cid),
+            };
+            (new_mst, op, false, vec![])
+        }
+    };
+
+    let blob_cids = extract_blob_cids(&input.record);
+    let backlinks_to_add = extract_backlinks(&record_uri, &input.record);
+
+    let commit_result = finalize_repo_write(
+        state,
+        ctx,
+        new_mst,
+        FinalizeParams {
+            did,
+            user_id,
+            controller_did,
+            delegation_detail: controller_did.map(|_| {
+                json!({
+                    "action": if is_update { "update" } else { "create" },
+                    "collection": input.collection,
+                    "rkey": input.rkey
+                })
+            }),
+            ops: vec![op],
+            blob_cids: &blob_cids,
+            backlinks_to_add,
+            backlinks_to_remove,
+        },
+    )
+    .await?;
+
+    Ok(PutRecordOutput {
+        uri: record_uri,
+        cid: record_cid.to_string(),
+        commit: Some(CommitInfo {
+            cid: commit_result.commit_cid.to_string(),
+            rev: commit_result.rev,
+        }),
+        validation_status,
+    })
+}

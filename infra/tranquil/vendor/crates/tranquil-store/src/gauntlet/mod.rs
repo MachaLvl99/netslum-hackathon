@@ -1,0 +1,47 @@
+pub mod chaos_walker;
+pub mod farm;
+pub mod flaky;
+pub mod invariants;
+pub mod leak;
+pub mod metrics;
+pub mod op;
+pub mod oracle;
+pub mod overrides;
+pub mod regression;
+pub mod runner;
+pub mod scenarios;
+pub mod shrink;
+pub mod soak;
+pub mod workload;
+
+pub use flaky::{
+    BackingMegabytes, DownIntervalSecs, FlakyConfig, FlakyError, FlakyMount, UpIntervalSecs,
+};
+pub use invariants::{
+    EventLogSnapshot, HintBackedByData, IndexBackedByDisk, IndexBlocksReadable, Invariant,
+    InvariantCtx, InvariantSet, InvariantViolation, SnapshotEvent, invariants_for,
+};
+pub use leak::{LeakGateBuildError, LeakGateConfig, LeakViolation, evaluate as evaluate_leak_gate};
+pub use metrics::{MetricName, MetricsSample, sample_harness};
+pub use op::{
+    AdvanceNanos, CollectionName, DidSeed, EventKind, FileChoice, Op, OpStream, PayloadSeed,
+    RecordKey, RetentionSecs, Seed, ValueSeed,
+};
+pub use oracle::{EventExpectation, Oracle};
+pub use overrides::{ConfigOverrides, GroupCommitOverrides, StoreOverrides};
+pub use regression::{RegressionRecord, RegressionViolation, default_root as regression_root};
+pub use runner::{
+    EventLogConfig, Gauntlet, GauntletBuildError, GauntletConfig, GauntletReport, Harness,
+    IoBackend, MaxFileSize, MaxSegmentSize, OpErrorCount, OpIndex, OpInterval, OpsExecuted,
+    RestartCount, RestartPolicy, RunLimits, ShardCount, StoreConfig, WallMs, WriterConcurrency,
+};
+pub use scenarios::{Scenario, UnknownScenario, config_for};
+pub use shrink::{ShrinkOutcome, shrink_failure};
+pub use soak::{
+    DEFAULT_CHUNK_OPS, DEFAULT_SAMPLE_INTERVAL_MS, InvariantViolationRecord, SoakConfig, SoakError,
+    SoakEvent, SoakReport, run_soak,
+};
+pub use workload::{
+    AdvanceMaxSecs, ByteRange, DidSpaceSize, KeySpaceSize, OpCount, OpWeights, RetentionMaxSecs,
+    SizeDistribution, ValueBytes, WorkloadModel,
+};

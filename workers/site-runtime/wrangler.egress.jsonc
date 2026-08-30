@@ -1,0 +1,7 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "netslum-site-egress",
+  "main": "src/egress.ts",
+  "compatibility_date": "2026-08-27",
+  "workers_dev": true
+}

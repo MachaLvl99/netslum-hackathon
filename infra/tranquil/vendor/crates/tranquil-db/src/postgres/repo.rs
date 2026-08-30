@@ -1,0 +1,1679 @@
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use sqlx::PgPool;
+use tranquil_db_traits::{
+    AccountStatus, CommitEventData, DbError, EventBlockInline, EventBlocks, FullRecordInfo,
+    ImportBlock, ImportRecord, ImportRepoError, PruneCount, RecordInfo, RecordWithTakedown,
+    RepoAccountInfo, RepoEventType, RepoInfo, RepoListItem, RepoRepository, RepoWithoutRev,
+    SequenceNumber, SequencedEvent, UserNeedingRecordBlobsBackfill, UserWithoutBlocks,
+};
+use tranquil_types::{AtUri, CidLink, Did, Handle, Nsid, Rkey, Tid};
+use uuid::Uuid;
+
+use super::col;
+use super::user::map_sqlx_error;
+use super::{column, column_vec, legacy_column, opt_column};
+
+struct RecordRow {
+    rkey: String,
+    record_cid: String,
+}
+
+struct SequencedEventRow {
+    seq: i64,
+    did: String,
+    created_at: DateTime<Utc>,
+    event_type: RepoEventType,
+    commit_cid: Option<String>,
+    prev_cid: Option<String>,
+    prev_data_cid: Option<String>,
+    ops: Option<serde_json::Value>,
+    blobs: Option<Vec<String>>,
+    block_cids: Option<Vec<Vec<u8>>>,
+    block_data: Option<Vec<Vec<u8>>>,
+    blocks_cids: Option<Vec<String>>,
+    handle: Option<String>,
+    active: Option<bool>,
+    status: Option<String>,
+    rev: Option<String>,
+}
+
+fn row_to_event_blocks(
+    block_cids: Option<Vec<Vec<u8>>>,
+    block_data: Option<Vec<Vec<u8>>>,
+    legacy_blocks_cids: Option<Vec<String>>,
+) -> Result<Option<EventBlocks>, DbError> {
+    match (block_cids, block_data) {
+        (Some(cids), Some(data)) if cids.len() == data.len() => match cids.is_empty() {
+            true => legacy_fallback(legacy_blocks_cids),
+            false => Ok(Some(EventBlocks::Inline(
+                cids.into_iter()
+                    .zip(data)
+                    .map(|(cid_bytes, data)| EventBlockInline { cid_bytes, data })
+                    .collect(),
+            ))),
+        },
+        (Some(_), Some(_)) => Err(DbError::CorruptData(
+            "repo_seq.block_cids/block_data length mismatch",
+        )),
+        (Some(_), None) | (None, Some(_)) => Err(DbError::CorruptData(
+            "repo_seq.block_cids/block_data partially populated",
+        )),
+        (None, None) => legacy_fallback(legacy_blocks_cids),
+    }
+}
+
+fn legacy_fallback(
+    legacy_blocks_cids: Option<Vec<String>>,
+) -> Result<Option<EventBlocks>, DbError> {
+    match legacy_blocks_cids {
+        Some(cids) if !cids.is_empty() => Ok(Some(EventBlocks::LegacyCids(column_vec(
+            cids,
+            col::REPO_SEQ_BLOCKS_CIDS,
+        )?))),
+        _ => Ok(None),
+    }
+}
+
+fn inline_to_paired_blocks(blocks: Option<&[EventBlockInline]>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    blocks
+        .map(|bs| {
+            bs.iter()
+                .map(|b| (b.cid_bytes.clone(), b.data.clone()))
+                .unzip()
+        })
+        .unwrap_or_default()
+}
+
+fn inline_into_paired_blocks(
+    blocks: Option<Vec<EventBlockInline>>,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    blocks
+        .map(|bs| bs.into_iter().map(|b| (b.cid_bytes, b.data)).unzip())
+        .unwrap_or_default()
+}
+
+fn map_sequenced_row(r: SequencedEventRow) -> Result<SequencedEvent, DbError> {
+    let status = r
+        .status
+        .as_deref()
+        .and_then(AccountStatus::parse)
+        .or_else(|| r.active.filter(|a| *a).map(|_| AccountStatus::Active));
+    let blocks = row_to_event_blocks(r.block_cids, r.block_data, r.blocks_cids)?;
+    Ok(SequencedEvent {
+        seq: r.seq.into(),
+        did: column(r.did, col::REPO_SEQ_DID)?,
+        created_at: r.created_at,
+        event_type: r.event_type,
+        commit_cid: opt_column(r.commit_cid, col::REPO_SEQ_COMMIT_CID)?,
+        prev_cid: opt_column(r.prev_cid, col::REPO_SEQ_PREV_CID)?,
+        prev_data_cid: opt_column(r.prev_data_cid, col::REPO_SEQ_PREV_DATA_CID)?,
+        ops: r.ops,
+        blobs: r
+            .blobs
+            .map(|blobs| column_vec(blobs, col::REPO_SEQ_BLOBS))
+            .transpose()?,
+        blocks,
+        handle: r
+            .handle
+            .and_then(|h| legacy_column(h, col::REPO_SEQ_HANDLE)),
+        active: r.active,
+        status,
+        rev: opt_column(r.rev, col::REPO_SEQ_REV)?,
+    })
+}
+
+fn collect_sequenced_rows(rows: Vec<SequencedEventRow>) -> Vec<SequencedEvent> {
+    rows.into_iter()
+        .filter_map(|r| {
+            let seq = r.seq;
+            map_sequenced_row(r)
+                .inspect_err(|e| {
+                    tracing::error!(seq, error = %e, "skipping a repo_seq row that doesn't decode");
+                })
+                .ok()
+        })
+        .collect()
+}
+
+const SEQUENCER_LOCK_KEY: i64 = 0x0074_7261_6e73_6571;
+const SEQUENCER_BATCH_SIZE: i64 = 1000;
+
+async fn notify_repo_pending(pool: &PgPool) {
+    if let Err(e) = sqlx::query!("NOTIFY repo_updates").execute(pool).await {
+        tracing::warn!(error = %e, "failed to notify repo_updates listeners");
+    }
+}
+
+async fn assign_one_batch(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    pool: &PgPool,
+) -> Result<i64, DbError> {
+    let pending_ids: Vec<i64> = sqlx::query_scalar!(
+        r#"SELECT id as "id!" FROM repo_seq WHERE seq IS NULL ORDER BY id LIMIT $1"#,
+        SEQUENCER_BATCH_SIZE
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let count = pending_ids.len() as i64;
+    if count == 0 {
+        tx.commit().await.map_err(map_sqlx_error)?;
+        return Ok(0);
+    }
+
+    let start = sqlx::query_scalar!(r#"SELECT nextval('firehose_seq') as "seq!""#)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+    if count > 1 {
+        sqlx::query!("SELECT setval('firehose_seq', $1)", start + count - 1)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx_error)?;
+    }
+
+    let assigned = sqlx::query!(
+        r#"UPDATE repo_seq r
+           SET seq = $1::bigint + (o.ord - 1)
+           FROM unnest($2::bigint[]) WITH ORDINALITY AS o(id, ord)
+           WHERE r.id = o.id"#,
+        start,
+        &pending_ids
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?
+    .rows_affected();
+
+    tx.commit().await.map_err(map_sqlx_error)?;
+    if assigned > 0 {
+        notify_repo_pending(pool).await;
+    }
+    Ok(count)
+}
+
+pub struct PostgresRepoRepository {
+    pool: PgPool,
+}
+
+impl PostgresRepoRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl RepoRepository for PostgresRepoRepository {
+    async fn update_repo_status(
+        &self,
+        _did: &Did,
+        _takedown: Option<bool>,
+        _takedown_ref: Option<&str>,
+        _deactivated: Option<bool>,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn create_repo(
+        &self,
+        user_id: Uuid,
+        _did: &Did,
+        _handle: &Handle,
+        repo_root_cid: &CidLink,
+        repo_rev: &Tid,
+    ) -> Result<(), DbError> {
+        sqlx::query!(
+            "INSERT INTO repos (user_id, repo_root_cid, repo_rev) VALUES ($1, $2, $3)",
+            user_id,
+            repo_root_cid.as_str(),
+            repo_rev.as_str()
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+
+    async fn update_repo_root(
+        &self,
+        user_id: Uuid,
+        repo_root_cid: &CidLink,
+        repo_rev: &Tid,
+    ) -> Result<(), DbError> {
+        sqlx::query!(
+            "UPDATE repos SET repo_root_cid = $1, repo_rev = $2, updated_at = NOW() WHERE user_id = $3",
+            repo_root_cid.as_str(),
+            repo_rev.as_str(),
+            user_id
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+
+    async fn update_repo_rev(&self, user_id: Uuid, repo_rev: &Tid) -> Result<(), DbError> {
+        sqlx::query!(
+            "UPDATE repos SET repo_rev = $1 WHERE user_id = $2",
+            repo_rev.as_str(),
+            user_id
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+
+    async fn delete_repo(&self, user_id: Uuid) -> Result<(), DbError> {
+        sqlx::query!("DELETE FROM repos WHERE user_id = $1", user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+
+    async fn get_repo_root_for_update(&self, user_id: Uuid) -> Result<Option<CidLink>, DbError> {
+        let result = sqlx::query_scalar!(
+            "SELECT repo_root_cid FROM repos WHERE user_id = $1 FOR UPDATE NOWAIT",
+            user_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        opt_column(result, col::REPOS_REPO_ROOT_CID)
+    }
+
+    async fn get_repo(&self, user_id: Uuid) -> Result<Option<RepoInfo>, DbError> {
+        let row = sqlx::query!(
+            "SELECT user_id, repo_root_cid, repo_rev FROM repos WHERE user_id = $1",
+            user_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        row.map(|r| {
+            Ok(RepoInfo {
+                user_id: r.user_id,
+                repo_root_cid: column(r.repo_root_cid, col::REPOS_REPO_ROOT_CID)?,
+                repo_rev: opt_column(r.repo_rev, col::REPOS_REPO_REV)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn get_repo_root_by_did(&self, did: &Did) -> Result<Option<CidLink>, DbError> {
+        let result = sqlx::query_scalar!(
+            "SELECT r.repo_root_cid FROM repos r JOIN users u ON r.user_id = u.id WHERE u.did = $1",
+            did.as_str()
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        opt_column(result, col::REPOS_REPO_ROOT_CID)
+    }
+
+    async fn count_repos(&self) -> Result<i64, DbError> {
+        let count = sqlx::query_scalar!(r#"SELECT COUNT(*) as "count!" FROM repos"#)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        Ok(count)
+    }
+
+    async fn get_repos_without_rev(&self) -> Result<Vec<RepoWithoutRev>, DbError> {
+        let rows = sqlx::query!("SELECT user_id, repo_root_cid FROM repos WHERE repo_rev IS NULL")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(RepoWithoutRev {
+                    user_id: r.user_id,
+                    repo_root_cid: column(r.repo_root_cid, col::REPOS_REPO_ROOT_CID)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn upsert_records(
+        &self,
+        repo_id: Uuid,
+        collections: &[Nsid],
+        rkeys: &[Rkey],
+        record_cids: &[CidLink],
+        repo_rev: &Tid,
+    ) -> Result<(), DbError> {
+        let collections_str: Vec<&str> = collections.iter().map(|c| c.as_str()).collect();
+        let rkeys_str: Vec<&str> = rkeys.iter().map(|r| r.as_str()).collect();
+        let cids_str: Vec<&str> = record_cids.iter().map(|c| c.as_str()).collect();
+
+        sqlx::query!(
+            r#"
+            INSERT INTO records (repo_id, collection, rkey, record_cid, repo_rev)
+            SELECT $1, collection, rkey, record_cid, $5
+            FROM UNNEST($2::text[], $3::text[], $4::text[]) AS t(collection, rkey, record_cid)
+            ON CONFLICT (repo_id, collection, rkey) DO UPDATE
+            SET record_cid = EXCLUDED.record_cid, repo_rev = EXCLUDED.repo_rev, created_at = NOW()
+            "#,
+            repo_id,
+            &collections_str as &[&str],
+            &rkeys_str as &[&str],
+            &cids_str as &[&str],
+            repo_rev.as_str()
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+
+    async fn delete_records(
+        &self,
+        repo_id: Uuid,
+        collections: &[Nsid],
+        rkeys: &[Rkey],
+    ) -> Result<(), DbError> {
+        let collections_str: Vec<&str> = collections.iter().map(|c| c.as_str()).collect();
+        let rkeys_str: Vec<&str> = rkeys.iter().map(|r| r.as_str()).collect();
+
+        sqlx::query!(
+            r#"
+            DELETE FROM records
+            WHERE repo_id = $1
+            AND (collection, rkey) IN (SELECT * FROM UNNEST($2::text[], $3::text[]))
+            "#,
+            repo_id,
+            &collections_str as &[&str],
+            &rkeys_str as &[&str]
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+
+    async fn delete_all_records(&self, repo_id: Uuid) -> Result<(), DbError> {
+        sqlx::query!("DELETE FROM records WHERE repo_id = $1", repo_id)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+
+    async fn get_record_cid(
+        &self,
+        repo_id: Uuid,
+        collection: &Nsid,
+        rkey: &Rkey,
+    ) -> Result<Option<CidLink>, DbError> {
+        let result = sqlx::query_scalar!(
+            "SELECT record_cid FROM records WHERE repo_id = $1 AND collection = $2 AND rkey = $3",
+            repo_id,
+            collection.as_str(),
+            rkey.as_str()
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        opt_column(result, col::RECORDS_RECORD_CID)
+    }
+
+    async fn list_records(
+        &self,
+        repo_id: Uuid,
+        collection: &Nsid,
+        cursor: Option<&Rkey>,
+        limit: i64,
+        reverse: bool,
+        rkey_start: Option<&Rkey>,
+        rkey_end: Option<&Rkey>,
+    ) -> Result<Vec<RecordInfo>, DbError> {
+        let to_record_info = |rows: Vec<RecordRow>| -> Result<Vec<RecordInfo>, DbError> {
+            Ok(rows
+                .into_iter()
+                .filter_map(|r| {
+                    Some(RecordInfo {
+                        rkey: legacy_column(r.rkey, col::RECORDS_RKEY)?,
+                        record_cid: legacy_column(r.record_cid, col::RECORDS_RECORD_CID)?,
+                    })
+                })
+                .collect())
+        };
+
+        let collection_str = collection.as_str();
+
+        if let Some(cursor_val) = cursor {
+            let cursor_str = cursor_val.as_str();
+            return match reverse {
+                false => {
+                    let rows = sqlx::query_as!(
+                        RecordRow,
+                        r#"SELECT rkey, record_cid FROM records
+                           WHERE repo_id = $1 AND collection = $2 AND rkey < $3
+                           ORDER BY rkey DESC LIMIT $4"#,
+                        repo_id,
+                        collection_str,
+                        cursor_str,
+                        limit
+                    )
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                    to_record_info(rows)
+                }
+                true => {
+                    let rows = sqlx::query_as!(
+                        RecordRow,
+                        r#"SELECT rkey, record_cid FROM records
+                           WHERE repo_id = $1 AND collection = $2 AND rkey > $3
+                           ORDER BY rkey ASC LIMIT $4"#,
+                        repo_id,
+                        collection_str,
+                        cursor_str,
+                        limit
+                    )
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                    to_record_info(rows)
+                }
+            };
+        }
+
+        if let (Some(start), Some(end)) = (rkey_start, rkey_end) {
+            let start_str = start.as_str();
+            let end_str = end.as_str();
+            return match reverse {
+                false => {
+                    let rows = sqlx::query_as!(
+                        RecordRow,
+                        r#"SELECT rkey, record_cid FROM records
+                           WHERE repo_id = $1 AND collection = $2 AND rkey >= $3 AND rkey <= $4
+                           ORDER BY rkey DESC LIMIT $5"#,
+                        repo_id,
+                        collection_str,
+                        start_str,
+                        end_str,
+                        limit
+                    )
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                    to_record_info(rows)
+                }
+                true => {
+                    let rows = sqlx::query_as!(
+                        RecordRow,
+                        r#"SELECT rkey, record_cid FROM records
+                           WHERE repo_id = $1 AND collection = $2 AND rkey >= $3 AND rkey <= $4
+                           ORDER BY rkey ASC LIMIT $5"#,
+                        repo_id,
+                        collection_str,
+                        start_str,
+                        end_str,
+                        limit
+                    )
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                    to_record_info(rows)
+                }
+            };
+        }
+
+        if let Some(start) = rkey_start {
+            let start_str = start.as_str();
+            return match reverse {
+                false => {
+                    let rows = sqlx::query_as!(
+                        RecordRow,
+                        r#"SELECT rkey, record_cid FROM records
+                           WHERE repo_id = $1 AND collection = $2 AND rkey >= $3
+                           ORDER BY rkey DESC LIMIT $4"#,
+                        repo_id,
+                        collection_str,
+                        start_str,
+                        limit
+                    )
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                    to_record_info(rows)
+                }
+                true => {
+                    let rows = sqlx::query_as!(
+                        RecordRow,
+                        r#"SELECT rkey, record_cid FROM records
+                           WHERE repo_id = $1 AND collection = $2 AND rkey >= $3
+                           ORDER BY rkey ASC LIMIT $4"#,
+                        repo_id,
+                        collection_str,
+                        start_str,
+                        limit
+                    )
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                    to_record_info(rows)
+                }
+            };
+        }
+
+        if let Some(end) = rkey_end {
+            let end_str = end.as_str();
+            return match reverse {
+                false => {
+                    let rows = sqlx::query_as!(
+                        RecordRow,
+                        r#"SELECT rkey, record_cid FROM records
+                           WHERE repo_id = $1 AND collection = $2 AND rkey <= $3
+                           ORDER BY rkey DESC LIMIT $4"#,
+                        repo_id,
+                        collection_str,
+                        end_str,
+                        limit
+                    )
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                    to_record_info(rows)
+                }
+                true => {
+                    let rows = sqlx::query_as!(
+                        RecordRow,
+                        r#"SELECT rkey, record_cid FROM records
+                           WHERE repo_id = $1 AND collection = $2 AND rkey <= $3
+                           ORDER BY rkey ASC LIMIT $4"#,
+                        repo_id,
+                        collection_str,
+                        end_str,
+                        limit
+                    )
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                    to_record_info(rows)
+                }
+            };
+        }
+
+        match reverse {
+            false => {
+                let rows = sqlx::query_as!(
+                    RecordRow,
+                    r#"SELECT rkey, record_cid FROM records
+                       WHERE repo_id = $1 AND collection = $2
+                       ORDER BY rkey DESC LIMIT $3"#,
+                    repo_id,
+                    collection_str,
+                    limit
+                )
+                .fetch_all(&self.pool)
+                .await
+                .map_err(map_sqlx_error)?;
+                to_record_info(rows)
+            }
+            true => {
+                let rows = sqlx::query_as!(
+                    RecordRow,
+                    r#"SELECT rkey, record_cid FROM records
+                       WHERE repo_id = $1 AND collection = $2
+                       ORDER BY rkey ASC LIMIT $3"#,
+                    repo_id,
+                    collection_str,
+                    limit
+                )
+                .fetch_all(&self.pool)
+                .await
+                .map_err(map_sqlx_error)?;
+                to_record_info(rows)
+            }
+        }
+    }
+
+    async fn get_all_records(&self, repo_id: Uuid) -> Result<Vec<FullRecordInfo>, DbError> {
+        let rows = sqlx::query!(
+            "SELECT collection, rkey, record_cid FROM records WHERE repo_id = $1",
+            repo_id
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(FullRecordInfo {
+                    collection: legacy_column(r.collection, col::RECORDS_COLLECTION)?,
+                    rkey: legacy_column(r.rkey, col::RECORDS_RKEY)?,
+                    record_cid: legacy_column(r.record_cid, col::RECORDS_RECORD_CID)?,
+                })
+            })
+            .collect())
+    }
+
+    async fn list_collections(&self, repo_id: Uuid) -> Result<Vec<Nsid>, DbError> {
+        let rows = sqlx::query_scalar!(
+            "SELECT DISTINCT collection FROM records WHERE repo_id = $1",
+            repo_id
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|c| legacy_column(c, col::RECORDS_COLLECTION))
+            .collect())
+    }
+
+    async fn count_records(&self, repo_id: Uuid) -> Result<i64, DbError> {
+        let count = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "count!" FROM records WHERE repo_id = $1"#,
+            repo_id
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(count)
+    }
+
+    async fn count_all_records(&self) -> Result<i64, DbError> {
+        let count = sqlx::query_scalar!(r#"SELECT COUNT(*) as "count!" FROM records"#)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        Ok(count)
+    }
+
+    async fn get_record_by_cid(
+        &self,
+        cid: &CidLink,
+    ) -> Result<Option<RecordWithTakedown>, DbError> {
+        let row = sqlx::query!(
+            "SELECT id, takedown_ref FROM records WHERE record_cid = $1",
+            cid.as_str()
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(row.map(|r| RecordWithTakedown {
+            id: r.id,
+            takedown_ref: r.takedown_ref,
+        }))
+    }
+
+    async fn referenced_record_cids(
+        &self,
+        repo_id: Uuid,
+        cids: &[CidLink],
+        excluded_keys: &[(&Nsid, &Rkey)],
+    ) -> Result<Vec<CidLink>, DbError> {
+        if cids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let cid_strs: Vec<String> = cids.iter().map(|c| c.as_str().to_owned()).collect();
+        let (excluded_collections, excluded_rkeys): (Vec<String>, Vec<String>) = excluded_keys
+            .iter()
+            .map(|(collection, rkey)| (collection.as_str().to_owned(), rkey.as_str().to_owned()))
+            .unzip();
+
+        let rows = sqlx::query_scalar!(
+            r#"
+            SELECT DISTINCT r.record_cid AS "record_cid!"
+            FROM records r
+            WHERE r.repo_id = $1
+              AND r.record_cid = ANY($2)
+              AND NOT EXISTS (
+                  SELECT 1 FROM UNNEST($3::text[], $4::text[]) AS k(collection, rkey)
+                  WHERE k.collection = r.collection AND k.rkey = r.rkey
+              )
+            "#,
+            repo_id,
+            &cid_strs,
+            &excluded_collections,
+            &excluded_rkeys
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        column_vec(rows, col::RECORDS_RECORD_CID)
+    }
+
+    async fn set_record_takedown(
+        &self,
+        cid: &CidLink,
+        takedown_ref: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query!(
+            "UPDATE records SET takedown_ref = $1 WHERE record_cid = $2",
+            takedown_ref,
+            cid.as_str()
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+
+    async fn insert_user_blocks(
+        &self,
+        user_id: Uuid,
+        block_cids: &[Vec<u8>],
+        repo_rev: &Tid,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            INSERT INTO user_blocks (user_id, block_cid, repo_rev)
+            SELECT $1, block_cid, $3 FROM UNNEST($2::bytea[]) AS t(block_cid)
+            ON CONFLICT (user_id, block_cid) DO NOTHING
+            "#,
+        )
+        .bind(user_id)
+        .bind(block_cids)
+        .bind(repo_rev.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+
+    async fn delete_user_blocks(
+        &self,
+        user_id: Uuid,
+        block_cids: &[Vec<u8>],
+    ) -> Result<(), DbError> {
+        sqlx::query!(
+            "DELETE FROM user_blocks WHERE user_id = $1 AND block_cid = ANY($2)",
+            user_id,
+            block_cids
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+
+    async fn count_user_blocks(&self, user_id: Uuid) -> Result<i64, DbError> {
+        let count = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "count!" FROM user_blocks WHERE user_id = $1"#,
+            user_id
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(count)
+    }
+
+    async fn get_user_block_cids_since_rev(
+        &self,
+        user_id: Uuid,
+        since_rev: Option<&Tid>,
+    ) -> Result<Vec<Vec<u8>>, DbError> {
+        let rows = match since_rev {
+            None => {
+                sqlx::query_scalar!(
+                    r#"
+                    SELECT block_cid AS "block_cid!" FROM user_blocks
+                    WHERE user_id = $1
+                    ORDER BY repo_rev ASC
+                    "#,
+                    user_id
+                )
+                .fetch_all(&self.pool)
+                .await
+            }
+            Some(rev) => {
+                sqlx::query_scalar!(
+                    r#"
+                    SELECT block_cid AS "block_cid!" FROM user_blocks
+                    WHERE user_id = $1 AND repo_rev > $2
+                    ORDER BY repo_rev ASC
+                    "#,
+                    user_id,
+                    rev.as_str()
+                )
+                .fetch_all(&self.pool)
+                .await
+            }
+        };
+
+        rows.map_err(map_sqlx_error)
+    }
+
+    async fn insert_commit_event(&self, data: &CommitEventData) -> Result<(), DbError> {
+        let (block_cids, block_data) = inline_to_paired_blocks(data.blocks.as_deref());
+        let blob_strs: Option<Vec<String>> = data
+            .blobs
+            .as_ref()
+            .map(|blobs| blobs.iter().map(|c| c.to_string()).collect());
+        sqlx::query!(
+            r#"
+            INSERT INTO repo_seq (did, event_type, commit_cid, prev_cid, ops, blobs, block_cids, block_data, prev_data_cid, rev)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "#,
+            data.did.as_str(),
+            data.event_type.as_str(),
+            data.commit_cid.as_ref().map(|c| c.as_str()),
+            data.prev_cid.as_ref().map(|c| c.as_str()),
+            data.ops,
+            blob_strs.as_deref(),
+            &block_cids as &[Vec<u8>],
+            &block_data as &[Vec<u8>],
+            data.prev_data_cid.as_ref().map(|c| c.as_str()),
+            data.rev.as_deref()
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        notify_repo_pending(&self.pool).await;
+        Ok(())
+    }
+
+    async fn insert_identity_event(
+        &self,
+        did: &Did,
+        handle: Option<&Handle>,
+    ) -> Result<(), DbError> {
+        let handle_str = handle.map(|h| h.as_str());
+        sqlx::query!(
+            r#"
+            INSERT INTO repo_seq (did, event_type, handle)
+            VALUES ($1, 'identity', $2)
+            "#,
+            did.as_str(),
+            handle_str
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        notify_repo_pending(&self.pool).await;
+        Ok(())
+    }
+
+    async fn insert_account_event(&self, did: &Did, status: AccountStatus) -> Result<(), DbError> {
+        let active = status.is_active();
+        let status_str = status.for_firehose().map(|s| s.as_str());
+        sqlx::query!(
+            r#"
+            INSERT INTO repo_seq (did, event_type, active, status)
+            VALUES ($1, 'account', $2, $3)
+            "#,
+            did.as_str(),
+            active,
+            status_str
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        notify_repo_pending(&self.pool).await;
+        Ok(())
+    }
+
+    async fn insert_sync_event(
+        &self,
+        did: &Did,
+        commit_cid: &CidLink,
+        rev: Option<&Tid>,
+        commit_bytes: &[u8],
+    ) -> Result<(), DbError> {
+        let cid_bytes = commit_cid
+            .to_cid()
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+        let block_cids: Vec<Vec<u8>> = vec![cid_bytes];
+        let block_data: Vec<Vec<u8>> = vec![commit_bytes.to_vec()];
+        sqlx::query!(
+            r#"
+            INSERT INTO repo_seq (did, event_type, commit_cid, rev, block_cids, block_data)
+            VALUES ($1, 'sync', $2, $3, $4, $5)
+            "#,
+            did.as_str(),
+            commit_cid.as_str(),
+            rev.map(|r| r.as_str()),
+            &block_cids as &[Vec<u8>],
+            &block_data as &[Vec<u8>]
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        notify_repo_pending(&self.pool).await;
+        Ok(())
+    }
+
+    async fn insert_genesis_commit_event(
+        &self,
+        did: &Did,
+        commit_cid: &CidLink,
+        mst_root_cid: &CidLink,
+        rev: &Tid,
+        commit_bytes: &[u8],
+        mst_root_bytes: &[u8],
+    ) -> Result<(), DbError> {
+        let ops = serde_json::json!([]);
+        let blobs: Vec<String> = vec![];
+        let commit_cid_bytes = commit_cid
+            .to_cid()
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+        let mst_cid_bytes = mst_root_cid
+            .to_cid()
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+        let block_cids: Vec<Vec<u8>> = vec![commit_cid_bytes, mst_cid_bytes];
+        let block_data: Vec<Vec<u8>> = vec![commit_bytes.to_vec(), mst_root_bytes.to_vec()];
+        let prev_cid: Option<&str> = None;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO repo_seq (did, event_type, commit_cid, prev_cid, ops, blobs, block_cids, block_data, rev)
+            VALUES ($1, 'commit', $2, $3::TEXT, $4, $5, $6, $7, $8)
+            "#,
+            did.as_str(),
+            commit_cid.as_str(),
+            prev_cid,
+            ops,
+            &blobs,
+            &block_cids as &[Vec<u8>],
+            &block_data as &[Vec<u8>],
+            rev.as_str()
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        notify_repo_pending(&self.pool).await;
+        Ok(())
+    }
+
+    async fn purge_did_events_keeping_latest(&self, did: &Did) -> Result<(), DbError> {
+        sqlx::query!(
+            r#"
+            DELETE FROM repo_seq
+            WHERE did = $1
+              AND id <> (SELECT id FROM repo_seq WHERE did = $1 ORDER BY id DESC LIMIT 1)
+            "#,
+            did.as_str()
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+
+    async fn assign_pending_sequences(&self) -> Result<u64, DbError> {
+        let mut total: u64 = 0;
+        loop {
+            let mut tx = self.pool.begin().await.map_err(map_sqlx_error)?;
+            let acquired = sqlx::query_scalar!(
+                r#"SELECT pg_try_advisory_xact_lock($1) as "locked!""#,
+                SEQUENCER_LOCK_KEY
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx_error)?;
+            if !acquired {
+                return Ok(total);
+            }
+            let count = assign_one_batch(tx, &self.pool).await?;
+            total += count as u64;
+            if count < SEQUENCER_BATCH_SIZE {
+                return Ok(total);
+            }
+        }
+    }
+
+    async fn flush_pending_sequences(&self) -> Result<(), DbError> {
+        loop {
+            let mut tx = self.pool.begin().await.map_err(map_sqlx_error)?;
+            sqlx::query!("SELECT pg_advisory_xact_lock($1)", SEQUENCER_LOCK_KEY)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_error)?;
+            let count = assign_one_batch(tx, &self.pool).await?;
+            if count < SEQUENCER_BATCH_SIZE {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn prune_events_older_than(&self, cutoff: DateTime<Utc>) -> Result<PruneCount, DbError> {
+        let result = sqlx::query!("DELETE FROM repo_seq WHERE created_at < $1", cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        Ok(PruneCount::Rows(result.rows_affected()))
+    }
+
+    async fn get_max_seq(&self) -> Result<SequenceNumber, DbError> {
+        let seq = sqlx::query_scalar!(r#"SELECT COALESCE(MAX(seq), 0) as "max!" FROM repo_seq"#)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        Ok(seq.into())
+    }
+
+    async fn get_min_seq_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<Option<SequenceNumber>, DbError> {
+        let seq = sqlx::query_scalar!(
+            "SELECT MIN(seq) FROM repo_seq WHERE created_at >= $1",
+            since
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(seq.map(SequenceNumber::from))
+    }
+
+    async fn get_account_with_repo(&self, did: &Did) -> Result<Option<RepoAccountInfo>, DbError> {
+        let row = sqlx::query!(
+            r#"SELECT u.id, u.did, u.deactivated_at, u.takedown_ref, r.repo_root_cid as "repo_root_cid?"
+               FROM users u
+               LEFT JOIN repos r ON r.user_id = u.id
+               WHERE u.did = $1"#,
+            did.as_str()
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        row.map(|r| {
+            Ok(RepoAccountInfo {
+                user_id: r.id,
+                did: column(r.did, col::USERS_DID)?,
+                deactivated_at: r.deactivated_at,
+                takedown_ref: r.takedown_ref,
+                repo_root_cid: opt_column(r.repo_root_cid, col::REPOS_REPO_ROOT_CID)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn get_events_since_seq(
+        &self,
+        since_seq: SequenceNumber,
+        limit: Option<i64>,
+    ) -> Result<Vec<SequencedEvent>, DbError> {
+        match limit {
+            Some(lim) => {
+                let rows = sqlx::query_as!(
+                    SequencedEventRow,
+                    r#"SELECT seq as "seq!", did, created_at, event_type as "event_type: RepoEventType", commit_cid, prev_cid, prev_data_cid,
+                              ops, blobs, block_cids, block_data, blocks_cids, handle, active, status, rev
+                       FROM repo_seq
+                       WHERE seq > $1
+                       ORDER BY seq ASC
+                       LIMIT $2"#,
+                    since_seq.as_i64(),
+                    lim
+                )
+                .fetch_all(&self.pool)
+                .await
+                .map_err(map_sqlx_error)?;
+                Ok(collect_sequenced_rows(rows))
+            }
+            None => {
+                let rows = sqlx::query_as!(
+                    SequencedEventRow,
+                    r#"SELECT seq as "seq!", did, created_at, event_type as "event_type: RepoEventType", commit_cid, prev_cid, prev_data_cid,
+                              ops, blobs, block_cids, block_data, blocks_cids, handle, active, status, rev
+                       FROM repo_seq
+                       WHERE seq > $1
+                       ORDER BY seq ASC"#,
+                    since_seq.as_i64()
+                )
+                .fetch_all(&self.pool)
+                .await
+                .map_err(map_sqlx_error)?;
+                Ok(collect_sequenced_rows(rows))
+            }
+        }
+    }
+
+    async fn get_events_in_seq_range(
+        &self,
+        start_seq: SequenceNumber,
+        end_seq: SequenceNumber,
+    ) -> Result<Vec<SequencedEvent>, DbError> {
+        let rows = sqlx::query_as!(
+            SequencedEventRow,
+            r#"SELECT seq as "seq!", did, created_at, event_type as "event_type: RepoEventType", commit_cid, prev_cid, prev_data_cid,
+                      ops, blobs, block_cids, block_data, blocks_cids, handle, active, status, rev
+               FROM repo_seq
+               WHERE seq > $1 AND seq < $2
+               ORDER BY seq ASC"#,
+            start_seq.as_i64(),
+            end_seq.as_i64()
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(collect_sequenced_rows(rows))
+    }
+
+    async fn get_event_by_seq(
+        &self,
+        seq: SequenceNumber,
+    ) -> Result<Option<SequencedEvent>, DbError> {
+        let row = sqlx::query_as!(
+            SequencedEventRow,
+            r#"SELECT seq as "seq!", did, created_at, event_type as "event_type: RepoEventType", commit_cid, prev_cid, prev_data_cid,
+                      ops, blobs, block_cids, block_data, blocks_cids, handle, active, status, rev
+               FROM repo_seq
+               WHERE seq = $1"#,
+            seq.as_i64()
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        row.map(map_sequenced_row).transpose()
+    }
+
+    async fn get_events_since_cursor(
+        &self,
+        cursor: SequenceNumber,
+        limit: i64,
+    ) -> Result<Vec<SequencedEvent>, DbError> {
+        let rows = sqlx::query_as!(
+            SequencedEventRow,
+            r#"SELECT seq as "seq!", did, created_at, event_type as "event_type: RepoEventType", commit_cid, prev_cid, prev_data_cid,
+                      ops, blobs, block_cids, block_data, blocks_cids, handle, active, status, rev
+               FROM repo_seq
+               WHERE seq > $1
+               ORDER BY seq ASC
+               LIMIT $2"#,
+            cursor.as_i64(),
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(collect_sequenced_rows(rows))
+    }
+
+    async fn list_repos_paginated(
+        &self,
+        cursor_did: Option<&Did>,
+        limit: i64,
+    ) -> Result<Vec<RepoListItem>, DbError> {
+        let cursor_str = cursor_did.map(|d| d.as_str()).unwrap_or("");
+        let rows = sqlx::query!(
+            r#"SELECT u.did, u.deactivated_at, u.takedown_ref, r.repo_root_cid, r.repo_rev
+               FROM repos r
+               JOIN users u ON r.user_id = u.id
+               WHERE u.did > $1
+               ORDER BY u.did ASC
+               LIMIT $2"#,
+            cursor_str,
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(RepoListItem {
+                    did: column(r.did, col::USERS_DID)?,
+                    deactivated_at: r.deactivated_at,
+                    takedown_ref: r.takedown_ref,
+                    repo_root_cid: column(r.repo_root_cid, col::REPOS_REPO_ROOT_CID)?,
+                    repo_rev: opt_column(r.repo_rev, col::REPOS_REPO_REV)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn get_repo_root_cid_by_user_id(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<CidLink>, DbError> {
+        let cid = sqlx::query_scalar!(
+            "SELECT repo_root_cid FROM repos WHERE user_id = $1",
+            user_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        opt_column(cid, col::REPOS_REPO_ROOT_CID)
+    }
+
+    async fn import_repo_data(
+        &self,
+        user_id: Uuid,
+        blocks: &[ImportBlock],
+        records: &[ImportRecord],
+        expected_root_cid: Option<&CidLink>,
+    ) -> Result<(), ImportRepoError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ImportRepoError::Database(e.to_string()))?;
+
+        let repo = sqlx::query!(
+            "SELECT repo_root_cid FROM repos WHERE user_id = $1 FOR UPDATE NOWAIT",
+            user_id
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db_err) = e
+                && db_err.code().as_deref() == Some("55P03")
+            {
+                return ImportRepoError::ConcurrentModification;
+            }
+            ImportRepoError::Database(e.to_string())
+        })?;
+
+        let repo = match repo {
+            Some(r) => r,
+            None => return Err(ImportRepoError::RepoNotFound),
+        };
+
+        if let Some(expected) = expected_root_cid
+            && repo.repo_root_cid.as_str() != expected.as_str()
+        {
+            return Err(ImportRepoError::ConcurrentModification);
+        }
+
+        let block_chunks: Vec<Vec<&ImportBlock>> = blocks
+            .iter()
+            .collect::<Vec<_>>()
+            .chunks(100)
+            .map(|c| c.to_vec())
+            .collect();
+
+        for chunk in block_chunks {
+            for block in chunk {
+                sqlx::query!(
+                    "INSERT INTO blocks (cid, data) VALUES ($1, $2) ON CONFLICT (cid) DO NOTHING",
+                    &block.cid_bytes,
+                    &block.data
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| ImportRepoError::Database(e.to_string()))?;
+            }
+        }
+
+        sqlx::query!("DELETE FROM records WHERE repo_id = $1", user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ImportRepoError::Database(e.to_string()))?;
+
+        for record in records {
+            sqlx::query!(
+                r#"
+                INSERT INTO records (repo_id, collection, rkey, record_cid)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (repo_id, collection, rkey) DO UPDATE SET record_cid = $4
+                "#,
+                user_id,
+                record.collection.as_str(),
+                record.rkey.as_str(),
+                record.record_cid.as_str()
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ImportRepoError::Database(e.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| ImportRepoError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn apply_commit(
+        &self,
+        input: tranquil_db_traits::ApplyCommitInput,
+    ) -> Result<tranquil_db_traits::ApplyCommitResult, tranquil_db_traits::ApplyCommitError> {
+        use tranquil_db_traits::ApplyCommitError;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ApplyCommitError::Database(e.to_string()))?;
+
+        let lock_result: Result<Option<_>, sqlx::Error> = sqlx::query!(
+            "SELECT repo_root_cid FROM repos WHERE user_id = $1 FOR UPDATE NOWAIT",
+            input.user_id
+        )
+        .fetch_optional(&mut *tx)
+        .await;
+
+        match lock_result {
+            Err(e) => {
+                if let Some(db_err) = e.as_database_error()
+                    && db_err.code().as_deref() == Some("55P03")
+                {
+                    return Err(ApplyCommitError::ConcurrentModification);
+                }
+                return Err(ApplyCommitError::Database(format!(
+                    "Failed to acquire repo lock: {}",
+                    e
+                )));
+            }
+            Ok(Some(row)) => {
+                if let Some(expected_root) = &input.expected_root_cid
+                    && row.repo_root_cid != expected_root.as_str()
+                {
+                    return Err(ApplyCommitError::ConcurrentModification);
+                }
+            }
+            Ok(None) => {
+                return Err(ApplyCommitError::RepoNotFound);
+            }
+        }
+
+        let is_account_active: bool =
+            sqlx::query_scalar("SELECT deactivated_at IS NULL FROM users WHERE id = $1")
+                .bind(input.user_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| ApplyCommitError::Database(e.to_string()))?
+                .flatten()
+                .unwrap_or(false);
+
+        sqlx::query("UPDATE repos SET repo_root_cid = $1, repo_rev = $2 WHERE user_id = $3")
+            .bind(&input.new_root_cid)
+            .bind(&input.new_rev)
+            .bind(input.user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApplyCommitError::Database(e.to_string()))?;
+
+        if !input.new_block_cids.is_empty() {
+            sqlx::query(
+                r#"
+                INSERT INTO user_blocks (user_id, block_cid, repo_rev)
+                SELECT $1, block_cid, $3 FROM UNNEST($2::bytea[]) AS t(block_cid)
+                ON CONFLICT (user_id, block_cid) DO NOTHING
+                "#,
+            )
+            .bind(input.user_id)
+            .bind(&input.new_block_cids)
+            .bind(&input.new_rev)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApplyCommitError::Database(e.to_string()))?;
+        }
+
+        if !input.obsolete_block_cids.is_empty() {
+            sqlx::query(
+                r#"
+                DELETE FROM user_blocks
+                WHERE user_id = $1
+                AND block_cid = ANY($2)
+                "#,
+            )
+            .bind(input.user_id)
+            .bind(&input.obsolete_block_cids)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApplyCommitError::Database(e.to_string()))?;
+        }
+
+        if !input.record_upserts.is_empty() {
+            let collections: Vec<&str> = input
+                .record_upserts
+                .iter()
+                .map(|r| r.collection.as_str())
+                .collect();
+            let rkeys: Vec<&str> = input
+                .record_upserts
+                .iter()
+                .map(|r| r.rkey.as_str())
+                .collect();
+            let cids: Vec<&str> = input
+                .record_upserts
+                .iter()
+                .map(|r| r.cid.as_str())
+                .collect();
+
+            sqlx::query(
+                r#"
+                INSERT INTO records (repo_id, collection, rkey, record_cid, repo_rev)
+                SELECT $1, t.collection, t.rkey, t.cid, $5
+                FROM UNNEST($2::text[], $3::text[], $4::text[]) AS t(collection, rkey, cid)
+                ON CONFLICT (repo_id, collection, rkey) DO UPDATE SET record_cid = EXCLUDED.record_cid, repo_rev = EXCLUDED.repo_rev
+                "#,
+            )
+            .bind(input.user_id)
+            .bind(&collections)
+            .bind(&rkeys)
+            .bind(&cids)
+            .bind(&input.new_rev)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApplyCommitError::Database(e.to_string()))?;
+        }
+
+        if !input.record_deletes.is_empty() {
+            let collections: Vec<&str> = input
+                .record_deletes
+                .iter()
+                .map(|r| r.collection.as_str())
+                .collect();
+            let rkeys: Vec<&str> = input
+                .record_deletes
+                .iter()
+                .map(|r| r.rkey.as_str())
+                .collect();
+
+            sqlx::query(
+                r#"
+                DELETE FROM records
+                WHERE repo_id = $1
+                AND (collection, rkey) IN (SELECT collection, rkey FROM UNNEST($2::text[], $3::text[]) AS t(collection, rkey))
+                "#,
+            )
+            .bind(input.user_id)
+            .bind(&collections)
+            .bind(&rkeys)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApplyCommitError::Database(e.to_string()))?;
+        }
+
+        if !input.backlinks_to_remove.is_empty() {
+            let remove_uris: Vec<&str> = input
+                .backlinks_to_remove
+                .iter()
+                .map(|u| u.as_str())
+                .collect();
+            sqlx::query!(
+                "DELETE FROM backlinks WHERE uri = ANY($1::text[])",
+                &remove_uris as &[&str],
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApplyCommitError::Database(e.to_string()))?;
+        }
+
+        if !input.backlinks_to_add.is_empty() {
+            let uris: Vec<&str> = input
+                .backlinks_to_add
+                .iter()
+                .map(|b| b.uri.as_str())
+                .collect();
+            let paths: Vec<&str> = input
+                .backlinks_to_add
+                .iter()
+                .map(|b| b.path.as_str())
+                .collect();
+            let link_tos: Vec<&str> = input
+                .backlinks_to_add
+                .iter()
+                .map(|b| b.link_to.as_str())
+                .collect();
+            sqlx::query!(
+                r#"
+                INSERT INTO backlinks (uri, path, link_to, repo_id)
+                SELECT unnest($1::text[]), unnest($2::text[]), unnest($3::text[]), $4
+                ON CONFLICT (uri, path) DO NOTHING
+                "#,
+                &uris as &[&str],
+                &paths as &[&str],
+                &link_tos as &[&str],
+                input.user_id,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApplyCommitError::Database(e.to_string()))?;
+        }
+
+        let event = input.commit_event;
+        let (event_block_cids, event_block_data) = inline_into_paired_blocks(event.blocks);
+        let event_blob_strs: Option<Vec<String>> = event
+            .blobs
+            .as_ref()
+            .map(|blobs| blobs.iter().map(|c| c.to_string()).collect());
+        sqlx::query!(
+            r#"
+            INSERT INTO repo_seq (did, event_type, commit_cid, prev_cid, ops, blobs, block_cids, block_data, prev_data_cid, rev)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "#,
+            event.did.as_str(),
+            event.event_type.as_str(),
+            event.commit_cid.as_ref().map(|c| c.as_str()),
+            event.prev_cid.as_ref().map(|c| c.as_str()),
+            event.ops,
+            event_blob_strs.as_deref(),
+            &event_block_cids as &[Vec<u8>],
+            &event_block_data as &[Vec<u8>],
+            event.prev_data_cid.as_ref().map(|c| c.as_str()),
+            event.rev.as_deref()
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApplyCommitError::Database(e.to_string()))?;
+
+        sqlx::query!("NOTIFY repo_updates")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApplyCommitError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ApplyCommitError::Database(e.to_string()))?;
+
+        Ok(tranquil_db_traits::ApplyCommitResult { is_account_active })
+    }
+
+    async fn get_users_without_blocks(&self) -> Result<Vec<UserWithoutBlocks>, DbError> {
+        let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT u.id as user_id, r.repo_root_cid, r.repo_rev
+            FROM users u
+            JOIN repos r ON r.user_id = u.id
+            WHERE NOT EXISTS (SELECT 1 FROM user_blocks ub WHERE ub.user_id = u.id)
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        rows.into_iter()
+            .map(|(user_id, repo_root_cid, repo_rev)| {
+                Ok(UserWithoutBlocks {
+                    user_id,
+                    repo_root_cid: column(repo_root_cid, col::REPOS_REPO_ROOT_CID)?,
+                    repo_rev: opt_column(repo_rev, col::REPOS_REPO_REV)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn get_users_needing_record_blobs_backfill(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<tranquil_db_traits::UserNeedingRecordBlobsBackfill>, DbError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT DISTINCT u.id as user_id, u.did
+            FROM users u
+            JOIN records r ON r.repo_id = u.id
+            WHERE NOT EXISTS (SELECT 1 FROM record_blobs rb WHERE rb.repo_id = u.id)
+            LIMIT $1
+            "#,
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(UserNeedingRecordBlobsBackfill {
+                    user_id: r.user_id,
+                    did: column(r.did, col::USERS_DID)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn insert_record_blobs(
+        &self,
+        repo_id: Uuid,
+        record_uris: &[AtUri],
+        blob_cids: &[CidLink],
+    ) -> Result<(), DbError> {
+        let uris_str: Vec<&str> = record_uris.iter().map(|u| u.as_str()).collect();
+        let cids_str: Vec<&str> = blob_cids.iter().map(|c| c.as_str()).collect();
+
+        sqlx::query!(
+            r#"
+            INSERT INTO record_blobs (repo_id, record_uri, blob_cid)
+            SELECT $1, record_uri, blob_cid
+            FROM UNNEST($2::text[], $3::text[]) AS t(record_uri, blob_cid)
+            ON CONFLICT (repo_id, record_uri, blob_cid) DO NOTHING
+            "#,
+            repo_id,
+            &uris_str as &[&str],
+            &cids_str as &[&str]
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+}

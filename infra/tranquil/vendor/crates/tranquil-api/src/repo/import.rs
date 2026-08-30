@@ -1,0 +1,377 @@
+use axum::{Json, body::Bytes, extract::State};
+use jacquard_common::types::{integer::LimitedU32, string::Tid};
+use jacquard_repo::storage::BlockStore;
+use k256::ecdsa::SigningKey;
+use serde_json::json;
+use tracing::{debug, error, info, warn};
+use tranquil_pds::api::EmptyResponse;
+use tranquil_pds::api::error::{ApiError, DbResultExt};
+use tranquil_pds::auth::{Auth, NotTakendown};
+use tranquil_pds::repo_ops::create_signed_commit;
+use tranquil_pds::state::AppState;
+use tranquil_pds::sync::import::{ImportError, apply_import, parse_car};
+use tranquil_pds::sync::verify::CarVerifier;
+use tranquil_pds::types::Did;
+use tranquil_types::{AtUri, CidLink};
+
+fn map_car_verify_error(e: tranquil_pds::sync::verify::VerifyError) -> ApiError {
+    use tranquil_pds::sync::verify::VerifyError;
+    match e {
+        VerifyError::DidMismatch {
+            commit_did,
+            expected_did,
+        } => ApiError::InvalidRepo(format!(
+            "CAR file is for DID {} but you are authenticated as {}",
+            commit_did, expected_did
+        )),
+        VerifyError::InvalidSignature => ApiError::InvalidRequest(
+            "Repo commit signature does not match the DID document signing key".into(),
+        ),
+        VerifyError::NoSigningKey => {
+            ApiError::InvalidRequest("DID document has no atproto signing key".into())
+        }
+        VerifyError::DidResolutionFailed(msg) => {
+            ApiError::InvalidRequest(format!("Could not resolve DID document: {}", msg))
+        }
+        VerifyError::MstValidationFailed(msg) => {
+            ApiError::InvalidRequest(format!("MST validation failed: {}", msg))
+        }
+        other => {
+            error!("CAR verification failed: {:?}", other);
+            ApiError::InvalidRequest(format!("CAR verification failed: {}", other))
+        }
+    }
+}
+
+pub async fn import_repo(
+    State(state): State<AppState>,
+    auth: Auth<NotTakendown>,
+    body: Bytes,
+) -> Result<Json<EmptyResponse>, ApiError> {
+    let accepting_imports = tranquil_config::get().import.accepting;
+    if !accepting_imports {
+        return Err(ApiError::InvalidRequest(
+            "Service is not accepting repo imports".into(),
+        ));
+    }
+    let max_size = tranquil_config::get().import.max_size as usize;
+    if body.len() > max_size {
+        return Err(ApiError::PayloadTooLarge(format!(
+            "Import size exceeds limit of {} bytes",
+            max_size
+        )));
+    }
+    let did = &auth.did;
+    let user = state
+        .repos
+        .user
+        .get_by_did(did)
+        .await
+        .log_db_err("fetching user")?
+        .ok_or(ApiError::AccountNotFound)?;
+    if user.takedown_ref.is_some() {
+        return Err(ApiError::AccountTakedown);
+    }
+    let user_id = user.id;
+    let expected_root_cid = state
+        .repos
+        .repo
+        .get_repo_root_cid_by_user_id(user_id)
+        .await
+        .map_err(|e| {
+            error!("DB error fetching repo root: {:?}", e);
+            ApiError::InternalError(None)
+        })?;
+    let (root, blocks) = match parse_car(&body).await {
+        Ok((r, b)) => (r, b),
+        Err(ImportError::InvalidRootCount) => {
+            return Err(ApiError::InvalidRequest(
+                "Expected exactly one root in CAR file".into(),
+            ));
+        }
+        Err(ImportError::CarParse(msg)) => {
+            return Err(ApiError::InvalidRequest(format!(
+                "Failed to parse CAR file: {}",
+                msg
+            )));
+        }
+        Err(e) => {
+            error!("CAR parsing error: {:?}", e);
+            return Err(ApiError::InvalidRequest(format!("Invalid CAR file: {}", e)));
+        }
+    };
+    info!(
+        "Importing repo for user {}: {} blocks, root {}",
+        did,
+        blocks.len(),
+        root
+    );
+    let skip_verification = std::env::var("SKIP_IMPORT_VERIFICATION")
+        .ok()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or_else(|| {
+            tranquil_config::try_get()
+                .map(|c| c.import.skip_verification)
+                .unwrap_or(false)
+        });
+    let is_migration = user.inbound_migration && user.deactivated_at.is_some();
+    if skip_verification {
+        warn!("Skipping all CAR verification for repo import (SKIP_IMPORT_VERIFICATION=true)");
+    } else if is_migration {
+        let verified = CarVerifier::new()
+            .verify_car_structure_only(&root, &blocks)
+            .map_err(map_car_verify_error)?;
+        debug!(
+            "CAR structure verified for migration import: rev={}, data_cid={}",
+            verified.rev, verified.data_cid
+        );
+    } else {
+        let verified = CarVerifier::new()
+            .verify_car(did, &root, &blocks)
+            .await
+            .map_err(map_car_verify_error)?;
+        debug!(
+            "CAR signature and structure verified: rev={}, data_cid={}",
+            verified.rev, verified.data_cid
+        );
+    }
+    let max_blocks = tranquil_config::get().import.max_blocks as usize;
+    let _write_lock = state.repo_write_locks.lock(user_id).await;
+
+    state
+        .block_store
+        .put_many(blocks.clone())
+        .await
+        .map_err(|e| {
+            error!("Failed to store import blocks: {:?}", e);
+            ApiError::InternalError(None)
+        })?;
+
+    match apply_import(
+        &state.repos.repo,
+        user_id,
+        root,
+        blocks.clone(),
+        max_blocks,
+        expected_root_cid.as_ref(),
+    )
+    .await
+    {
+        Ok(import_result) => {
+            info!(
+                "Successfully imported {} records for user {}",
+                import_result.records.len(),
+                did
+            );
+            let blob_refs: Vec<(AtUri, CidLink)> = import_result
+                .records
+                .iter()
+                .flat_map(|record| {
+                    let record_uri = AtUri::from_parts(did, &record.collection, &record.rkey);
+                    record
+                        .blob_refs
+                        .iter()
+                        .map(move |blob_ref| (record_uri.clone(), blob_ref.cid.clone()))
+                })
+                .collect();
+
+            if !blob_refs.is_empty() {
+                let (record_uris, blob_cids): (Vec<AtUri>, Vec<CidLink>) =
+                    blob_refs.into_iter().unzip();
+
+                match state
+                    .repos
+                    .blob
+                    .insert_record_blobs(user_id, &record_uris, &blob_cids)
+                    .await
+                {
+                    Ok(()) => {
+                        info!(
+                            "Recorded {} blob references for imported repo",
+                            blob_cids.len()
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to insert record_blobs: {:?}", e);
+                    }
+                }
+            }
+            let key_row = state
+                .repos
+                .user
+                .get_user_with_key_by_did(did)
+                .await
+                .map_err(|e| {
+                    error!("DB error fetching signing key: {:?}", e);
+                    ApiError::InternalError(None)
+                })?
+                .ok_or_else(|| {
+                    error!("No signing key found for user {}", did);
+                    ApiError::InternalError(Some("Signing key not found".into()))
+                })?;
+            let key_bytes =
+                tranquil_pds::config::decrypt_key(&key_row.key_bytes, key_row.encryption_version)
+                    .map_err(|e| {
+                    error!("Failed to decrypt signing key: {}", e);
+                    ApiError::InternalError(None)
+                })?;
+            let signing_key = SigningKey::from_slice(&key_bytes).map_err(|e| {
+                error!("Invalid signing key: {:?}", e);
+                ApiError::InternalError(None)
+            })?;
+            let new_rev = Tid::now(LimitedU32::MIN);
+            let new_rev_str = new_rev.to_string();
+            let (commit_bytes, _sig) =
+                create_signed_commit(did, import_result.data_cid, &new_rev, None, &signing_key)
+                    .map_err(|e| {
+                        error!("Failed to create new commit: {}", e);
+                        ApiError::InternalError(None)
+                    })?;
+            let new_root_cid: cid::Cid =
+                state.block_store.put(&commit_bytes).await.map_err(|e| {
+                    error!("Failed to store new commit block: {:?}", e);
+                    ApiError::InternalError(None)
+                })?;
+            let new_root_cid_link = CidLink::from(&new_root_cid);
+            let new_rev_tid = tranquil_pds::types::Tid::from(new_rev.clone());
+            state
+                .repos
+                .repo
+                .update_repo_root(user_id, &new_root_cid_link, &new_rev_tid)
+                .await
+                .map_err(|e| {
+                    error!("Failed to update repo root: {:?}", e);
+                    ApiError::InternalError(None)
+                })?;
+            match tranquil_pds::scheduled::collect_current_repo_blocks(
+                &state.block_store,
+                &new_root_cid,
+            )
+            .await
+            {
+                Ok(reachable) => {
+                    if !reachable.is_complete() {
+                        error!(
+                            unreadable = reachable.unreadable,
+                            "scheduling a structural repair because the imported repo walk could \
+                             not read every block"
+                        );
+                        tranquil_pds::repo_ops::schedule_repo_repair(&state, user_id);
+                    }
+                    state
+                        .repos
+                        .repo
+                        .insert_user_blocks(user_id, &reachable.block_cids, &new_rev_tid)
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to insert user_blocks: {:?}", e);
+                            ApiError::InternalError(None)
+                        })?;
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to walk the imported repo: {:?}. The root is already updated and \
+                         a scheduled structural repair will rebuild user_blocks",
+                        e
+                    );
+                    tranquil_pds::repo_ops::schedule_repo_repair(&state, user_id);
+                }
+            }
+            let new_root_str = new_root_cid.to_string();
+            info!(
+                "Created new commit for imported repo: cid={}, rev={}",
+                new_root_str, new_rev_str
+            );
+            if !is_migration
+                && let Err(e) =
+                    sequence_import_event(&state, did, &new_root_cid_link, &commit_bytes).await
+            {
+                warn!("Failed to sequence import event: {:?}", e);
+            }
+            if tranquil_config::get().server.age_assurance_override {
+                let birthdate_pref = json!({
+                    "$type": "app.bsky.actor.defs#personalDetailsPref",
+                    "birthDate": "1998-05-06T00:00:00.000Z"
+                });
+                if let Err(e) = state
+                    .repos
+                    .infra
+                    .insert_account_preference_if_not_exists(
+                        user_id,
+                        "app.bsky.actor.defs#personalDetailsPref",
+                        birthdate_pref,
+                    )
+                    .await
+                {
+                    warn!(
+                        "Failed to set default birthdate preference for migrated user: {:?}",
+                        e
+                    );
+                }
+            }
+            Ok(Json(EmptyResponse {}))
+        }
+        Err(ImportError::SizeLimitExceeded) => Err(ApiError::PayloadTooLarge(format!(
+            "Import exceeds block limit of {}",
+            max_blocks
+        ))),
+        Err(ImportError::RepoNotFound) => Err(ApiError::RepoNotFound(Some(
+            "Repository not initialized for this account".into(),
+        ))),
+        Err(ImportError::InvalidCbor(msg)) => Err(ApiError::InvalidRequest(format!(
+            "Invalid CBOR data: {}",
+            msg
+        ))),
+        Err(ImportError::InvalidCommit(msg)) => Err(ApiError::InvalidRequest(format!(
+            "Invalid commit structure: {}",
+            msg
+        ))),
+        Err(ImportError::BlockNotFound(cid)) => Err(ApiError::InvalidRequest(format!(
+            "Referenced block not found in CAR: {}",
+            cid
+        ))),
+        Err(ImportError::ConcurrentModification) => Err(ApiError::InvalidSwap(Some(
+            "Repository is being modified by another operation, please retry".into(),
+        ))),
+        Err(ImportError::VerificationFailed(ve)) => Err(ApiError::InvalidRequest(format!(
+            "CAR verification failed: {}",
+            ve
+        ))),
+        Err(ImportError::DidMismatch { car_did, auth_did }) => Err(ApiError::InvalidRequest(
+            format!("CAR is for {} but authenticated as {}", car_did, auth_did),
+        )),
+        Err(e) => {
+            error!("Import error: {:?}", e);
+            Err(ApiError::InternalError(None))
+        }
+    }
+}
+
+async fn sequence_import_event(
+    state: &AppState,
+    did: &Did,
+    commit_cid: &CidLink,
+    commit_bytes: &[u8],
+) -> Result<(), tranquil_db_traits::DbError> {
+    let commit_cid_parsed = commit_cid
+        .to_cid()
+        .expect("CidLink invariant: validated at construction");
+    let inline_commit = tranquil_db_traits::EventBlockInline {
+        cid_bytes: commit_cid_parsed.to_bytes(),
+        data: commit_bytes.to_vec(),
+    };
+    let data = tranquil_db_traits::CommitEventData {
+        did: did.clone(),
+        event_type: tranquil_db_traits::RepoEventType::Commit,
+        commit_cid: Some(commit_cid.clone()),
+        prev_cid: None,
+        ops: Some(serde_json::json!([])),
+        blobs: Some(vec![]),
+        blocks: Some(vec![inline_commit]),
+        prev_data_cid: None,
+        rev: None,
+    };
+
+    state.repos.repo.insert_commit_event(&data).await?;
+    Ok(())
+}

@@ -1,0 +1,67 @@
+use axum::{
+    Json,
+    response::{IntoResponse, Response},
+};
+use serde::{Deserialize, Serialize};
+use tranquil_pds::rate_limit::{HandleVerificationLimit, RateLimited};
+use tranquil_pds::types::{Did, Handle};
+
+#[derive(Deserialize)]
+pub struct VerifyHandleOwnershipInput {
+    pub handle: Handle,
+    pub did: Did,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyHandleOwnershipOutput {
+    pub verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub async fn verify_handle_ownership(
+    _rate_limit: RateLimited<HandleVerificationLimit>,
+    Json(input): Json<VerifyHandleOwnershipInput>,
+) -> Response {
+    let did_str = input.did.as_str();
+
+    let dns_mismatch = match tranquil_pds::handle::resolve_handle_dns(&input.handle).await {
+        Ok(did) if did == did_str => {
+            return Json(VerifyHandleOwnershipOutput {
+                verified: true,
+                method: Some("dns".to_string()),
+                error: None,
+            })
+            .into_response();
+        }
+        Ok(did) => Some(format!(
+            "DNS record points to {}, expected {}",
+            did, did_str
+        )),
+        Err(_) => None,
+    };
+
+    match tranquil_pds::handle::resolve_handle_http(&input.handle).await {
+        Ok(did) if did == did_str => Json(VerifyHandleOwnershipOutput {
+            verified: true,
+            method: Some("http".to_string()),
+            error: None,
+        })
+        .into_response(),
+        Ok(did) => Json(VerifyHandleOwnershipOutput {
+            verified: false,
+            method: None,
+            error: Some(format!("Handle resolves to {}, expected {}", did, did_str)),
+        })
+        .into_response(),
+        Err(e) => Json(VerifyHandleOwnershipOutput {
+            verified: false,
+            method: None,
+            error: Some(dns_mismatch.unwrap_or_else(|| format!("Handle resolution failed: {}", e))),
+        })
+        .into_response(),
+    }
+}
