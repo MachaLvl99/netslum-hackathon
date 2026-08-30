@@ -19,8 +19,8 @@
     "wrangler:types": "pnpm --filter @netslum/web wrangler:types && pnpm --filter @netslum/site-runtime wrangler:types",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "deploy:web": "pnpm --filter @netslum/web deploy",
-    "deploy:runtime": "pnpm --filter @netslum/site-runtime deploy",
+    "deploy:web": "pnpm --filter @netslum/web run deploy",
+    "deploy:runtime": "pnpm --filter @netslum/site-runtime run deploy",
     "db:migrate:local": "pnpm --filter @netslum/web db:migrate:local"
   },
   "devDependencies": {
