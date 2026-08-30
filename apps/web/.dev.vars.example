@@ -1,0 +1,7 @@
+OAUTH_STORE_KEY="REPLACE_WITH_BASE64_32_BYTES"
+OAUTH_CLIENT_PRIVATE_JWK='{"kty":"EC","crv":"P-256","x":"...","y":"...","d":"...","kid":"netslum-local-key","alg":"ES256","key_ops":["sign"]}'
+SITE_ADMIN_DIDS="did:plc:admin123"
+CLOUDFLARE_ACCOUNT_ID="local-account-id"
+CLOUDFLARE_API_TOKEN="local-api-token"
+SITE_ASSET_ORIGIN="http://127.0.0.1:8791"
+SITE_RUNTIME_ORIGIN="http://127.0.0.1:8792"

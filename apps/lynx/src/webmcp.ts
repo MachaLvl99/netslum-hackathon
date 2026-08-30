@@ -162,7 +162,7 @@ export function registerNetslumTools(
         const parsed = feedQuerySchema.parse(input ?? {});
         navigate("/town");
         const url = `/api/feed?limit=${parsed.limit}${parsed.cursor ? `&cursor=${encodeURIComponent(parsed.cursor)}` : ""}`;
-        const data = await fetchJson<TownFeedRes>(url, { ...(context?.signal ? { signal: context.signal } : {}) });
+        const data = await fetchJson<TownFeedRes>(url, { ...(options?.signal ? { signal: options.signal } : {}) });
         const bounded = {
           posts: data.posts.slice(0, 5).map((p) => ({
             uri: p.uri,
@@ -206,7 +206,7 @@ export function registerNetslumTools(
         const zoneKey = `${prefix}.${place}.${state}`;
         const route = `/zone/${zoneKey}`;
         navigate(route);
-        const data = await fetchJson<ChaosGateRes>(`/api/zones/${zoneKey}`, { ...(context?.signal ? { signal: context.signal } : {}) });
+        const data = await fetchJson<ChaosGateRes>(`/api/zones/${zoneKey}`, { ...(options?.signal ? { signal: options.signal } : {}) });
         const summaries = data.objects.slice(0, 10).map((o) => {
           let preview = "";
           if (o.type === "note") preview = o.text?.slice(0, 80) ?? "";
@@ -245,7 +245,7 @@ export function registerNetslumTools(
         const { actor } = schema.parse(input);
         const route = `/profile/${encodeURIComponent(actor)}`;
         navigate(route);
-        const data = await fetchJson<ProfileRes>(`/api/profile/${encodeURIComponent(actor)}`, { ...(context?.signal ? { signal: context.signal } : {}) });
+        const data = await fetchJson<ProfileRes>(`/api/profile/${encodeURIComponent(actor)}`, { ...(options?.signal ? { signal: options.signal } : {}) });
         return wrapResult("show_profile", route, {
           did: data.did,
           handle: data.handle,
@@ -395,7 +395,7 @@ export function registerNetslumTools(
     execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
       try {
         navigate("/studio");
-        const data = await fetchJson<SiteDraftRes>("/api/sites/draft", { ...(context?.signal ? { signal: context.signal } : {}) });
+        const data = await fetchJson<SiteDraftRes>("/api/sites/draft", { ...(options?.signal ? { signal: options.signal } : {}) });
         const summaries = data.files.slice(0, 12).map((f) => ({ path: f.path, size: f.size, mimeType: f.mimeType }));
         return wrapResult("open_site_editor", "/studio", {
           slug: data.slug,
@@ -428,7 +428,7 @@ export function registerNetslumTools(
       try {
         const parsed = readSiteFileSchema.parse(input);
         const url = `/api/sites/file?path=${encodeURIComponent(parsed.path)}&offset=${parsed.offset}&maxChars=${parsed.maxChars}`;
-        const data = await fetchJson<SiteFileRes>(url, { ...(context?.signal ? { signal: context.signal } : {}) });
+        const data = await fetchJson<SiteFileRes>(url, { ...(options?.signal ? { signal: options.signal } : {}) });
         return wrapResult("read_site_file", "/studio", data);
       } catch (err) {
         return wrapError("read_site_file", "/studio", err);
