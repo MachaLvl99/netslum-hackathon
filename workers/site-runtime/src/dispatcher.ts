@@ -1,6 +1,6 @@
 import { sha256Hex } from "@netslum/contracts";
 
-interface RuntimeEnv { DB: D1Database; PRODUCTION_DISPATCHER: DispatchNamespace; SITE_RATE: RateLimit; }
+interface RuntimeEnv { DB: D1Database; PRODUCTION_DISPATCHER?: DispatchNamespace; SITE_RATE: RateLimit; }
 interface SiteRow { did: string; active_worker: string | null; status: "active" | "suspended"; }
 const ONE_MIB = 1024 * 1024;
 const METHODS = "GET,POST,PUT,PATCH,DELETE,OPTIONS";
@@ -42,6 +42,7 @@ export default {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": METHODS, "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers") ?? "authorization,content-type", "Access-Control-Max-Age": "86400" } });
     }
+    if (!env.PRODUCTION_DISPATCHER) return jsonError("SERVERLESS_UNAVAILABLE", 503);
     const allowed = await env.SITE_RATE.limit({ key: siteId });
     if (!allowed.success) return jsonError("RATE_LIMITED", 429);
     const site = await lookupSite(env, siteId);

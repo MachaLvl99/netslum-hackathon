@@ -5,7 +5,7 @@ export interface CloudflareEnv {
   DB: D1Database;
   SITE_FILES: R2Bucket;
   ZONES: DurableObjectNamespace<ZoneRoom>;
-  STAGING_DISPATCHER: DispatchNamespace;
+  STAGING_DISPATCHER?: DispatchNamespace;
   PUBLIC_URL: string;
   PDS_URL: string;
   BSKY_PUBLIC_API: string;

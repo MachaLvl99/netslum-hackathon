@@ -16,6 +16,7 @@
     "@atproto/oauth-client-node": "0.5.4",
     "@netslum/contracts": "workspace:*",
     "@netslum/sandbox": "workspace:*",
+    "esbuild": "0.28.1",
     "hono": "4.13.5",
     "webmcp-types": "0.1.5",
     "zod": "4.4.3"

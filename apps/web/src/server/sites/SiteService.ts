@@ -9,6 +9,7 @@ import {
   validateSiteBundle,
   type SiteFile
 } from "@netslum/contracts";
+import { transform } from "esbuild";
 import type { CloudflareEnv } from "../../types.js";
 import { canPublishSite } from "../auth/session.js";
 import { getOAuthClient } from "../auth/oauth.js";
@@ -310,26 +311,32 @@ export class SiteService {
       const serverlessEnabled = this.env.SERVERLESS_ENABLED === "true";
 
       // 3. Staging validation if _worker.js exists and serverless is enabled
-      if (workerFile && serverlessEnabled) {
+      if (workerFile) {
         const workerObj = await this.env.SITE_FILES.get(`draft/${siteId}/${input.revision}/_worker.js`);
         if (!workerObj) throw new NetslumError("NOT_FOUND", "Worker file missing", 404);
         const scriptCode = await workerObj.text();
 
-        stagedWorkerName = `${siteId}-stage-${input.revision.slice(0, 12)}`;
-        stagedKvId = await this.provisioner.getOrCreateKvNamespace(`staging-${siteId}`);
+        if (serverlessEnabled && this.env.STAGING_DISPATCHER) {
+          stagedWorkerName = `${siteId}-stage-${input.revision.slice(0, 12)}`;
+          stagedKvId = await this.provisioner.getOrCreateKvNamespace(`staging-${siteId}`);
+          await this.provisioner.putDispatchScript("netslum-sites-staging", stagedWorkerName, scriptCode, stagedKvId);
 
-        await this.provisioner.putDispatchScript("netslum-sites-staging", stagedWorkerName, scriptCode, stagedKvId);
-
-        // Validate via staging dispatcher subrequest
-        try {
-          const stagedDispatcher = this.env.STAGING_DISPATCHER.get(stagedWorkerName);
-          const valResp = await stagedDispatcher.fetch(new Request("https://staging.internal/__netslum_validate__", { signal: AbortSignal.timeout(5000) }));
-          if (valResp.status >= 500) {
-            throw new NetslumError("WORKER_FAILED", "Worker returned 5xx during staging validation", 502);
+          try {
+            const stagedDispatcher = this.env.STAGING_DISPATCHER.get(stagedWorkerName);
+            const valResp = await stagedDispatcher.fetch(new Request("https://staging.internal/__netslum_validate__", { signal: AbortSignal.timeout(5000) }));
+            if (valResp.status >= 500) {
+              throw new NetslumError("WORKER_FAILED", "Worker returned 5xx during staging validation", 502);
+            }
+          } catch (err) {
+            if (err instanceof NetslumError) throw err;
+            throw new NetslumError("WORKER_FAILED", "Worker validation failed or timed out", 502);
           }
-        } catch (err) {
-          if (err instanceof NetslumError) throw err;
-          throw new NetslumError("WORKER_FAILED", "Worker validation failed or timed out", 502);
+        } else {
+          try {
+            await transform(scriptCode, { loader: "js", format: "esm" });
+          } catch {
+            throw new NetslumError("INVALID_INPUT", "Invalid _worker.js syntax", 400);
+          }
         }
       }
 

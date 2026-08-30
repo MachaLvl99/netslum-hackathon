@@ -6,18 +6,17 @@
   "compatibility_flags": ["nodejs_compat"],
   "assets": { "directory": "../lynx/dist", "binding": "ASSETS", "run_worker_first": true },
   "routes": [{ "pattern": "netslum.macha.sh", "custom_domain": true }],
-  "d1_databases": [{ "binding": "DB", "database_name": "netslum", "database_id": "REPLACE_WITH_D1_ID", "migrations_dir": "migrations" }],
+  "d1_databases": [{ "binding": "DB", "database_name": "netslum", "database_id": "a350f70d-3550-4801-87c1-ec9bbdd85993", "migrations_dir": "migrations" }],
   "r2_buckets": [{ "binding": "SITE_FILES", "bucket_name": "netslum-sites", "preview_bucket_name": "netslum-sites-preview" }],
   "durable_objects": { "bindings": [{ "name": "ZONES", "class_name": "ZoneRoom" }] },
-  "dispatch_namespaces": [{ "binding": "STAGING_DISPATCHER", "namespace": "netslum-sites-staging", "outbound": { "service": "netslum-site-egress" } }],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ZoneRoom"] }],
   "vars": {
     "PUBLIC_URL": "https://netslum.macha.sh",
     "PDS_URL": "https://pds.netslum.macha.sh",
     "BSKY_PUBLIC_API": "https://public.api.bsky.app",
-    "SERVERLESS_ENABLED": "true",
-    "SITE_ASSET_ORIGIN": "https://netslum-site-assets.REPLACE.workers.dev",
-    "SITE_RUNTIME_ORIGIN": "https://netslum-site-runtime.REPLACE.workers.dev"
+    "SERVERLESS_ENABLED": "false",
+    "SITE_ASSET_ORIGIN": "https://netslum-site-assets.ryan-a27.workers.dev",
+    "SITE_RUNTIME_ORIGIN": "https://netslum-site-runtime.ryan-a27.workers.dev"
   },
   "env": {
     "preview": {
