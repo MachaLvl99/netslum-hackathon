@@ -44,7 +44,7 @@ services:
       - key: BLOB_STORAGE_PATH
         value: /var/lib/tranquil-pds/blobs
       - key: INVITE_CODE_REQUIRED
-        value: 'true'
+        value: 'false'
       - key: DISABLE_ACCOUNT_VERIFICATION_GATE
         value: 'true'
       - key: ENABLE_PDS_HOSTED_DID_WEB
