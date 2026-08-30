@@ -20,4 +20,5 @@ onlyBuiltDependencies:
   - workerd
 
 patchedDependencies:
+  '@atproto-labs/fetch@0.3.5': patches/@atproto-labs__fetch@0.3.5.patch
   '@lynx-js/web-core@0.25.0': patches/@lynx-js__web-core@0.25.0.patch

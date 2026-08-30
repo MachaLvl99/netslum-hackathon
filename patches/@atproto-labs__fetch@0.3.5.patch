@@ -1,0 +1,23 @@
+diff --git a/dist/fetch.js b/dist/fetch.js
+index 8b05a31572c7bd5420fbbd533714a109079b7f6b..2f67bef6f4353c311aacf865527bb41149a5b10d 100644
+--- a/dist/fetch.js
++++ b/dist/fetch.js
+@@ -4,8 +4,16 @@ export function toRequestTransformer(requestTransformer) {
+     };
+ }
+ export function asRequest(input, init) {
+-    if (!init && input instanceof Request)
++    if (!init && input instanceof Request) {
++        if (input.redirect === 'error') {
++            return new Request(input, { redirect: 'manual' });
++        }
+         return input;
+-    return new Request(input, init);
++    }
++    const options = init ? { ...init } : {};
++    if (options.redirect === 'error') {
++        options.redirect = 'manual';
++    }
++    return new Request(input, options);
+ }
+ //# sourceMappingURL=fetch.js.map

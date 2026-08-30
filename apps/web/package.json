@@ -12,6 +12,7 @@
     "db:migrate:local": "wrangler d1 migrations apply netslum --local --persist-to ../../.wrangler/state"
   },
   "dependencies": {
+    "@atproto-labs/handle-resolver": "0.4.8",
     "@atproto/api": "0.20.42",
     "@atproto/oauth-client-node": "0.5.4",
     "@netslum/contracts": "workspace:*",

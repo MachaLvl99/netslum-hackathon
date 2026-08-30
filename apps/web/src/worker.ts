@@ -40,6 +40,13 @@ app.onError((err, c) => {
     const status = (err.status >= 400 && err.status <= 599 ? err.status : 500) as 500;
     return c.json({ code: err.code, message: err.message, retryable: err.retryable, data: err.data }, status);
   }
+  const cause = err instanceof Error ? (err as Error & { cause?: unknown }).cause : undefined;
+  console.error("Unhandled worker error:", JSON.stringify({
+    name: err?.name,
+    message: err?.message,
+    stack: err?.stack,
+    cause: cause instanceof Error ? { name: cause.name, message: cause.message, stack: cause.stack, cause: (cause as Error & { cause?: unknown }).cause } : cause
+  }));
   return c.json({ code: "WORKER_FAILED", message: "Internal server error", retryable: false }, 500);
 });
 

@@ -5,6 +5,7 @@ settings:
   excludeLinksFromLockfile: false
 
 patchedDependencies:
+  '@atproto-labs/fetch@0.3.5': 6e4bc3c8e8b2179149c274743b2db3bf8109700f96e7db41b5465fbdd9e31398
   '@lynx-js/web-core@0.25.0': c37eedc349d2da3b0f1c2eec175be84daa05b5c8606cd4c7d2bf3091eafe96d8
 
 importers:
@@ -69,6 +70,9 @@ importers:
 
   apps/web:
     dependencies:
+      '@atproto-labs/handle-resolver':
+        specifier: 0.4.8
+        version: 0.4.8
       '@atproto/api':
         specifier: 0.20.42
         version: 0.20.42
@@ -3251,7 +3255,7 @@ snapshots:
 
   '@atproto-labs/did-resolver@0.3.7':
     dependencies:
-      '@atproto-labs/fetch': 0.3.5
+      '@atproto-labs/fetch': 0.3.5(patch_hash=6e4bc3c8e8b2179149c274743b2db3bf8109700f96e7db41b5465fbdd9e31398)
       '@atproto-labs/pipe': 0.2.4
       '@atproto-labs/simple-store': 0.5.1
       '@atproto-labs/simple-store-memory': 0.2.6
@@ -3260,14 +3264,14 @@ snapshots:
 
   '@atproto-labs/fetch-node@0.3.7':
     dependencies:
-      '@atproto-labs/fetch': 0.3.5
+      '@atproto-labs/fetch': 0.3.5(patch_hash=6e4bc3c8e8b2179149c274743b2db3bf8109700f96e7db41b5465fbdd9e31398)
       '@atproto-labs/pipe': 0.2.4
       ipaddr.js: 2.5.0
       undici_v6: undici@6.28.0
       undici_v7: undici@7.29.0
       undici_v8: undici@8.10.0
 
-  '@atproto-labs/fetch@0.3.5':
+  '@atproto-labs/fetch@0.3.5(patch_hash=6e4bc3c8e8b2179149c274743b2db3bf8109700f96e7db41b5465fbdd9e31398)':
     dependencies:
       '@atproto-labs/pipe': 0.2.4
 
@@ -3380,7 +3384,7 @@ snapshots:
   '@atproto/oauth-client@0.8.4':
     dependencies:
       '@atproto-labs/did-resolver': 0.3.7
-      '@atproto-labs/fetch': 0.3.5
+      '@atproto-labs/fetch': 0.3.5(patch_hash=6e4bc3c8e8b2179149c274743b2db3bf8109700f96e7db41b5465fbdd9e31398)
       '@atproto-labs/handle-resolver': 0.4.8
       '@atproto-labs/identity-resolver': 0.4.7
       '@atproto-labs/simple-store': 0.5.1
