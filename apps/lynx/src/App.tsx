@@ -1,30 +1,334 @@
 import { useInitData, useInitDataChanged, useState } from "@lynx-js/react";
 
-interface InitData { route?: string; authenticated?: boolean; handle?: string; canPublishSite?: boolean; }
-declare let NativeModules: { NetslumHost: { navigate(route: string): void } };
+interface InitData {
+  route?: string;
+  authenticated?: boolean;
+  did?: string;
+  handle?: string;
+  canPublishSite?: boolean;
+  feed?: string;
+  zone?: string;
+  site?: string;
+}
+
+interface PostItem {
+  uri: string;
+  cid?: string;
+  author: { handle: string; displayName?: string };
+  record: { text: string; createdAt: string };
+}
+
+interface ZoneObjectItem {
+  id: string;
+  type: string;
+  x: number;
+  y: number;
+  text?: string;
+  shape?: string;
+  color?: string;
+  targetZoneKey?: string;
+}
+
+interface LynxInputEvent {
+  detail: { value: string };
+}
+
+declare let NativeModules: {
+  NetslumHost: {
+    navigate(route: string): void;
+    logout(): void;
+    postMessage(text: string): void;
+    placeZoneNote(zoneKey: string, text: string): void;
+    saveSiteFile(path: string, content: string, revision?: string): void;
+    publishSite(revision: string): void;
+  };
+};
+
+const FEATURED_ZONES = [
+  "hidden.archive.echo",
+  "burning.market.static",
+  "silent.garden.rain",
+  "wandering.harbor.dream",
+  "broken.labyrinth.void",
+  "electric.cathedral.dawn"
+];
 
 export function App() {
   const initial = useInitData() as InitData;
   const [data, setData] = useState<InitData>(initial);
   useInitDataChanged((next) => setData(next as InitData));
-  const navigate = (route: string): void => NativeModules.NetslumHost.navigate(route);
+
+  const [postText, setPostText] = useState("");
+  const [noteText, setNoteText] = useState("");
+  const [editorText, setEditorText] = useState("");
+
+  const navigate = (route: string): void => {
+    try {
+      NativeModules.NetslumHost.navigate(route);
+    } catch (e) {
+      void e;
+    }
+  };
+
+  const logout = (): void => {
+    try {
+      NativeModules.NetslumHost.logout();
+    } catch (e) {
+      void e;
+    }
+  };
+
+  const submitPost = (): void => {
+    if (!postText.trim()) return;
+    try {
+      NativeModules.NetslumHost.postMessage(postText);
+      setPostText("");
+    } catch (e) {
+      void e;
+    }
+  };
+
+  const submitNote = (zoneKey: string): void => {
+    if (!noteText.trim()) return;
+    try {
+      NativeModules.NetslumHost.placeZoneNote(zoneKey, noteText);
+      setNoteText("");
+    } catch (e) {
+      void e;
+    }
+  };
+
   const route = data.route ?? "/";
+  const activeZoneKey = route.startsWith("/zone/") ? route.slice(6) : "hidden.archive.echo";
+
+  let posts: PostItem[] = [];
+  try {
+    if (data.feed) {
+      const parsed = JSON.parse(data.feed) as { posts?: PostItem[] };
+      posts = parsed.posts ?? [];
+    }
+  } catch (e) {
+    void e;
+  }
+
+  let zoneObjects: ZoneObjectItem[] = [];
+  let zoneVersion = 0;
+  try {
+    if (data.zone) {
+      const parsed = JSON.parse(data.zone) as { objects?: ZoneObjectItem[]; version?: number };
+      zoneObjects = parsed.objects ?? [];
+      zoneVersion = parsed.version ?? 0;
+    }
+  } catch (e) {
+    void e;
+  }
+
+  let siteSlug = "";
+  let siteRevision = "";
+  let siteFiles: Array<{ path: string; size: number }> = [];
+  try {
+    if (data.site) {
+      const parsed = JSON.parse(data.site) as { slug?: string; revision?: string; files?: Array<{ path: string; size: number }> };
+      siteSlug = parsed.slug ?? "";
+      siteRevision = parsed.revision ?? "";
+      siteFiles = parsed.files ?? [];
+    }
+  } catch (e) {
+    void e;
+  }
 
   return (
     <page className="page">
       <view className="shell">
         <view className="header">
           <text className="wordmark" accessibility-label="netslum home" bindtap={() => navigate("/")}>netslum</text>
-          <text className="nav-item" accessibility-label="open town square" bindtap={() => navigate("/town")}>town</text>
-          <text className="nav-item" accessibility-label="open chaos gate" bindtap={() => navigate("/gate")}>chaos gate</text>
-          {data.canPublishSite ? <text className="nav-item" accessibility-label="open site studio" bindtap={() => navigate("/studio")}>studio</text> : null}
+          <text className={route === "/town" ? "nav-item active" : "nav-item"} accessibility-label="open town square" bindtap={() => navigate("/town")}>town</text>
+          <text className={route.startsWith("/gate") || route.startsWith("/zone/") ? "nav-item active" : "nav-item"} accessibility-label="open chaos gate" bindtap={() => navigate("/gate")}>chaos gate</text>
+          {data.canPublishSite ? (
+            <text className={route === "/studio" ? "nav-item active" : "nav-item"} accessibility-label="open site studio" bindtap={() => navigate("/studio")}>studio</text>
+          ) : null}
+          <view className="header-right">
+            {data.authenticated ? (
+              <view className="user-badge">
+                <text className="user-handle">{data.handle ?? "connected"}</text>
+                <text className="logout-btn" bindtap={logout}>sign out</text>
+              </view>
+            ) : (
+              <text className="login-btn" bindtap={() => navigate("/oauth/login")}>sign in</text>
+            )}
+          </view>
         </view>
-        <view className="content">
-          <text className="kicker">AGENT-FIRST // AT PROTOCOL</text>
-          <text className="title">{route === "/" ? "the network remembers what we make together" : route}</text>
-          <text className="copy">People direct agents. Agents use visible site tools. Posts remain owned by AT Protocol accounts; local invitees can publish programmable pages.</text>
-          <text className="primary" accessibility-label={data.authenticated ? "enter town" : "sign in with AT Protocol"} bindtap={() => navigate(data.authenticated ? "/town" : "/oauth/login")}>{data.authenticated ? "enter town" : "sign in with AT Protocol"}</text>
-        </view>
+
+        {/* VIEW ROUTING */}
+        {route === "/" ? (
+          <view className="content">
+            <text className="kicker">AGENT-FIRST // AT PROTOCOL SOCIAL SPACE</text>
+            <text className="title">the network remembers what we make together</text>
+            <text className="copy">
+              A federated cyber-commons inspired by .hack Net Slum. Humans guide Codex desktop agents through WebMCP tools,
+              traverse Chaos Gate sectors, and publish programmable personal pages powered by Tranquil PDS.
+            </text>
+            <view className="action-row">
+              <text
+                className="primary"
+                accessibility-label={data.authenticated ? "enter town square" : "sign in with AT Protocol"}
+                bindtap={() => navigate(data.authenticated ? "/town" : "/oauth/login")}
+              >
+                {data.authenticated ? "ENTER TOWN SQUARE &rarr;" : "SIGN IN WITH AT PROTOCOL"}
+              </text>
+            </view>
+            <view className="featured-section">
+              <text className="section-title">// ACTIVE CHAOS GATE SECTORS</text>
+              <view className="portal-grid">
+                {FEATURED_ZONES.map((z) => (
+                  <view key={z} className="portal-card" bindtap={() => navigate(`/zone/${z}`)}>
+                    <text className="portal-name">&Delta; {z}</text>
+                    <text className="portal-desc">Warp directly into sector</text>
+                  </view>
+                ))}
+              </view>
+            </view>
+          </view>
+        ) : route === "/town" ? (
+          <view className="content">
+            <text className="kicker">TOWN SQUARE // FEDERATED FEED</text>
+            <text className="title">#netslum public commons</text>
+            
+            {data.authenticated ? (
+              <view className="composer-card">
+                <text className="composer-label">BROADCAST TO #NETSLUM</text>
+                <input
+                  className="composer-input"
+                  placeholder="Share notes, thoughts, or directives with the slum..."
+                  value={postText}
+                  bindinput={(e: LynxInputEvent) => setPostText(e.detail.value)}
+                />
+                <view className="composer-footer">
+                  <text className="char-count">{postText.length} / 300</text>
+                  <text className="primary-sm" bindtap={submitPost}>POST TO FEDIVERSE</text>
+                </view>
+              </view>
+            ) : (
+              <view className="notice-card" bindtap={() => navigate("/oauth/login")}>
+                <text className="notice-text">Sign in with AT Protocol to broadcast posts and drop notes.</text>
+              </view>
+            )}
+
+            <view className="feed-list">
+              {posts.length > 0 ? (
+                posts.map((p) => (
+                  <view key={p.uri} className="post-card">
+                    <view className="post-header">
+                      <text className="post-author">@{p.author.handle}</text>
+                      <text className="post-time">{new Date(p.record.createdAt).toLocaleTimeString()}</text>
+                    </view>
+                    <text className="post-body">{p.record.text}</text>
+                  </view>
+                ))
+              ) : (
+                <view className="empty-card">
+                  <text className="empty-text">No posts yet on #netslum. Be the first to broadcast!</text>
+                </view>
+              )}
+            </view>
+          </view>
+        ) : route === "/gate" || route.startsWith("/zone/") ? (
+          <view className="content">
+            <text className="kicker">CHAOS GATE // SPATIAL SECTOR</text>
+            <text className="title">&Delta; {activeZoneKey}</text>
+            <text className="copy">State Version {zoneVersion} &bull; {zoneObjects.length} Objects Active</text>
+
+            <view className="zone-grid-view">
+              <text className="section-title">// DROPPED NOTES & ARTIFACTS</text>
+              <view className="objects-grid">
+                {zoneObjects.length > 0 ? (
+                  zoneObjects.map((o) => (
+                    <view key={o.id} className="object-card">
+                      <text className="object-type">[{o.type.toUpperCase()}] ({o.x}, {o.y})</text>
+                      <text className="object-content">{o.text || o.shape || o.targetZoneKey || "artifact"}</text>
+                    </view>
+                  ))
+                ) : (
+                  <view className="empty-card">
+                    <text className="empty-text">This sector is silent. Leave a note or sigil below.</text>
+                  </view>
+                )}
+              </view>
+            </view>
+
+            {data.authenticated ? (
+              <view className="composer-card">
+                <text className="composer-label">DROP A NOTE IN THIS SECTOR</text>
+                <input
+                  className="composer-input"
+                  placeholder="Inscribe a message for other travelers..."
+                  value={noteText}
+                  bindinput={(e: LynxInputEvent) => setNoteText(e.detail.value)}
+                />
+                <view className="composer-footer">
+                  <text className="primary-sm" bindtap={() => submitNote(activeZoneKey)}>DROP NOTE</text>
+                </view>
+              </view>
+            ) : null}
+
+            <view className="featured-section">
+              <text className="section-title">// OTHER DESTINATIONS</text>
+              <view className="portal-grid">
+                {FEATURED_ZONES.filter(z => z !== activeZoneKey).map((z) => (
+                  <view key={z} className="portal-card" bindtap={() => navigate(`/zone/${z}`)}>
+                    <text className="portal-name">&Delta; {z}</text>
+                  </view>
+                ))}
+              </view>
+            </view>
+          </view>
+        ) : route === "/studio" ? (
+          <view className="content">
+            <text className="kicker">PERSONAL SITE STUDIO // @{siteSlug}</text>
+            <text className="title">programmable page editor</text>
+            <text className="copy">Draft Revision: {siteRevision.slice(0, 16) || "none"}</text>
+
+            <view className="studio-container">
+              <view className="file-tree">
+                <text className="tree-header">FILES ({siteFiles.length})</text>
+                {siteFiles.map(f => (
+                  <text key={f.path} className="file-item">&bull; {f.path} ({f.size} B)</text>
+                ))}
+              </view>
+
+              <view className="editor-panel">
+                <text className="editor-label">EDIT index.html</text>
+                <input
+                  className="editor-input"
+                  placeholder="<h1>Welcome to my Net Slum site</h1>"
+                  value={editorText}
+                  bindinput={(e: LynxInputEvent) => setEditorText(e.detail.value)}
+                />
+                <view className="editor-actions">
+                  <text className="primary-sm" bindtap={() => {
+                    try {
+                      NativeModules.NetslumHost.saveSiteFile("index.html", editorText || "<h1>Welcome to netslum</h1>", siteRevision);
+                    } catch (e) {
+                      void e;
+                    }
+                  }}>SAVE DRAFT</text>
+                  <text className="secondary-sm" bindtap={() => {
+                    try {
+                      NativeModules.NetslumHost.publishSite(siteRevision);
+                    } catch (e) {
+                      void e;
+                    }
+                  }}>PUBLISH SITE LIVE</text>
+                </view>
+              </view>
+            </view>
+          </view>
+        ) : (
+          <view className="content">
+            <text className="title">404 // NOT FOUND</text>
+            <text className="primary" bindtap={() => navigate("/")}>RETURN TO NETSLUM &rarr;</text>
+          </view>
+        )}
       </view>
     </page>
   );
