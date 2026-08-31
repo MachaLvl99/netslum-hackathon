@@ -9,13 +9,18 @@ interface InitData {
   feed?: string;
   zone?: string;
   site?: string;
+  actionStatus?: string;
+  routeError?: string;
+  feedStale?: boolean;
+  lastUpdatedAt?: number;
 }
 
 interface PostItem {
   uri: string;
-  cid?: string;
-  author: { handle: string; displayName?: string };
-  record: { text: string; createdAt: string };
+  cid: string;
+  author: { did: string; handle: string; displayName?: string };
+  text: string;
+  createdAt: string;
 }
 
 interface ZoneObjectItem {
@@ -31,6 +36,13 @@ interface ZoneObjectItem {
 
 interface LynxInputEvent {
   detail: { value: string };
+}
+
+interface ActionStatus {
+  action: "post" | "zone" | "site" | "logout";
+  state: "busy" | "success" | "error";
+  message: string;
+  nonce: number;
 }
 
 declare let NativeModules: {
@@ -56,11 +68,24 @@ const FEATURED_ZONES = [
 export function App() {
   const initial = useInitData() as InitData;
   const [data, setData] = useState<InitData>(initial);
-  useInitDataChanged((next) => setData(next as InitData));
-
   const [postText, setPostText] = useState("");
   const [noteText, setNoteText] = useState("");
   const [editorText, setEditorText] = useState("");
+  const [handledStatusNonce, setHandledStatusNonce] = useState(0);
+  useInitDataChanged((next) => {
+    const updated = next as InitData;
+    setData(updated);
+    if (!updated.actionStatus) return;
+    try {
+      const status = JSON.parse(updated.actionStatus) as ActionStatus;
+      if (status.nonce === handledStatusNonce) return;
+      setHandledStatusNonce(status.nonce);
+      if (status.state === "success" && status.action === "post") setPostText("");
+      if (status.state === "success" && status.action === "zone") setNoteText("");
+    } catch (error) {
+      void error;
+    }
+  });
 
   const navigate = (route: string): void => {
     try {
@@ -79,22 +104,20 @@ export function App() {
   };
 
   const submitPost = (): void => {
-    if (!postText.trim()) return;
+    if (!postText.trim() || postText.length > 290) return;
     try {
       NativeModules.NetslumHost.postMessage(postText);
-      setPostText("");
-    } catch (e) {
-      void e;
+    } catch (error) {
+      void error;
     }
   };
 
   const submitNote = (zoneKey: string): void => {
-    if (!noteText.trim()) return;
+    if (!noteText.trim() || noteText.length > 280) return;
     try {
       NativeModules.NetslumHost.placeZoneNote(zoneKey, noteText);
-      setNoteText("");
-    } catch (e) {
-      void e;
+    } catch (error) {
+      void error;
     }
   };
 
@@ -137,6 +160,15 @@ export function App() {
     void e;
   }
 
+  let actionStatus: ActionStatus | null = null;
+  try {
+    if (data.actionStatus) actionStatus = JSON.parse(data.actionStatus) as ActionStatus;
+  } catch (error) {
+    void error;
+  }
+  const postBusy = actionStatus?.action === "post" && actionStatus.state === "busy";
+  const zoneBusy = actionStatus?.action === "zone" && actionStatus.state === "busy";
+
   return (
     <page className="page">
       <view className="shell">
@@ -158,6 +190,18 @@ export function App() {
             )}
           </view>
         </view>
+        {actionStatus ? (
+          <view className={`status-bar status-${actionStatus.state}`}>
+            <text className="status-text">{actionStatus.message}</text>
+          </view>
+        ) : null}
+        {data.routeError ? (
+          <view className="status-bar status-error">
+            <text className="status-text">{data.routeError}</text>
+          </view>
+        ) : null}
+
+        <scroll-view className="content-scroll" scroll-orientation="vertical">
 
         {/* VIEW ROUTING */}
         {route === "/" ? (
@@ -193,6 +237,7 @@ export function App() {
           <view className="content">
             <text className="kicker">TOWN SQUARE // FEDERATED FEED</text>
             <text className="title">#netslum public commons</text>
+            {data.feedStale ? <text className="stale-label">LIVE INDEX DELAYED // SHOWING RECENT LOCAL ACTIVITY</text> : null}
             
             {data.authenticated ? (
               <view className="composer-card">
@@ -204,8 +249,8 @@ export function App() {
                   bindinput={(e: LynxInputEvent) => setPostText(e.detail.value)}
                 />
                 <view className="composer-footer">
-                  <text className="char-count">{postText.length} / 300</text>
-                  <text className="primary-sm" bindtap={submitPost}>POST TO FEDIVERSE</text>
+                  <text className="char-count">{postText.length + 10} / 300</text>
+                  <text className={postBusy ? "primary-sm busy" : "primary-sm"} bindtap={submitPost}>{postBusy ? "PUBLISHING…" : "POST TO FEDIVERSE"}</text>
                 </view>
               </view>
             ) : (
@@ -220,9 +265,9 @@ export function App() {
                   <view key={p.uri} className="post-card">
                     <view className="post-header">
                       <text className="post-author">@{p.author.handle}</text>
-                      <text className="post-time">{new Date(p.record.createdAt).toLocaleTimeString()}</text>
+                      <text className="post-time">{new Date(p.createdAt).toLocaleTimeString()}</text>
                     </view>
-                    <text className="post-body">{p.record.text}</text>
+                    <text className="post-body">{p.text}</text>
                   </view>
                 ))
               ) : (
@@ -266,7 +311,7 @@ export function App() {
                   bindinput={(e: LynxInputEvent) => setNoteText(e.detail.value)}
                 />
                 <view className="composer-footer">
-                  <text className="primary-sm" bindtap={() => submitNote(activeZoneKey)}>DROP NOTE</text>
+                  <text className={zoneBusy ? "primary-sm busy" : "primary-sm"} bindtap={() => submitNote(activeZoneKey)}>{zoneBusy ? "DROPPING…" : "DROP NOTE"}</text>
                 </view>
               </view>
             ) : null}
@@ -329,6 +374,7 @@ export function App() {
             <text className="primary" bindtap={() => navigate("/")}>RETURN TO NETSLUM &rarr;</text>
           </view>
         )}
+        </scroll-view>
       </view>
     </page>
   );

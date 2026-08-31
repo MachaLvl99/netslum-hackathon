@@ -16,6 +16,58 @@ const subjectRecordSchema = z.object({ subject: z.object({ uri: z.string().optio
 
 interface FeedCacheRow { response_json: string; fetched_at: number; expires_at: number; }
 interface DraftRow { draft_id: string; revision: string; text: string; reply_to_uri: string | null; }
+interface OptimisticPostRow { post_json: string; }
+
+const optimisticPostSchema = z.object({
+  uri: z.string(),
+  cid: z.string(),
+  author: z.object({
+    did: z.string(),
+    handle: z.string(),
+    displayName: z.string().optional()
+  }),
+  text: z.string(),
+  createdAt: z.string()
+});
+
+const localReposSchema = z.object({
+  repos: z.array(z.object({
+    did: z.string(),
+    active: z.boolean().optional()
+  }))
+});
+
+const localRecordsSchema = z.object({
+  records: z.array(z.object({
+    uri: z.string(),
+    cid: z.string(),
+    value: z.unknown()
+  }))
+});
+
+export function mergeTownPosts(
+  optimistic: PostSummary[],
+  authoritative: PostSummary[],
+  limit: number
+): PostSummary[] {
+  const posts = new Map<string, PostSummary>();
+  for (const post of optimistic) posts.set(post.uri, post);
+  for (const post of authoritative) posts.set(post.uri, post);
+  return [...posts.values()]
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .slice(0, limit);
+}
+
+function didDocumentUrl(did: string): string | null {
+  if (did.startsWith("did:plc:")) return `https://plc.directory/${encodeURIComponent(did)}`;
+  if (!did.startsWith("did:web:")) return null;
+  const parts = did.slice("did:web:".length).split(":").map(decodeURIComponent);
+  const host = parts.shift();
+  if (!host) return null;
+  return parts.length === 0
+    ? `https://${host}/.well-known/did.json`
+    : `https://${host}/${parts.join("/")}/did.json`;
+}
 
 function graphemeLength(text: string): number {
   return [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)].length;
@@ -32,44 +84,183 @@ export class AtprotoService {
     return new Agent(session);
   }
 
+  private async getOptimisticPosts(cursor: string | undefined, limit: number, now: number): Promise<PostSummary[]> {
+    if (cursor) return [];
+    const rows = await this.env.DB.prepare(
+      "SELECT post_json FROM optimistic_post WHERE expires_at > ? ORDER BY expires_at DESC LIMIT ?"
+    ).bind(now, limit).all<OptimisticPostRow>();
+    const posts: PostSummary[] = [];
+    for (const row of rows.results) {
+      try {
+        const parsed = optimisticPostSchema.safeParse(JSON.parse(row.post_json));
+        if (!parsed.success) continue;
+        const author: PostSummary["author"] = {
+          did: parsed.data.author.did,
+          handle: parsed.data.author.handle
+        };
+        if (parsed.data.author.displayName) author.displayName = parsed.data.author.displayName;
+        posts.push({ ...parsed.data, author });
+      } catch {
+        // Ignore malformed short-lived projection rows; AT repositories remain authoritative.
+      }
+    }
+    return posts;
+  }
+
+  private async resolveActorHandle(actorDid: string): Promise<string> {
+    const url = didDocumentUrl(actorDid);
+    if (!url) return actorDid;
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(3000) });
+      if (!response.ok) return actorDid;
+      const document = z.object({ alsoKnownAs: z.array(z.string()).optional() }).parse(await response.json());
+      const alias = document.alsoKnownAs?.find((value) => value.startsWith("at://"));
+      return alias ? alias.slice("at://".length) : actorDid;
+    } catch {
+      return actorDid;
+    }
+  }
+
+  private async getLocalPdsPosts(cursor: string | undefined, limit: number): Promise<PostSummary[]> {
+    if (cursor) return [];
+    const pdsUrl = this.env.PDS_URL.replace(/\/$/, "");
+    const reposResponse = await fetch(
+      `${pdsUrl}/xrpc/com.atproto.sync.listRepos?limit=25`,
+      { signal: AbortSignal.timeout(4000) }
+    );
+    if (!reposResponse.ok) return [];
+    const repos = localReposSchema.parse(await reposResponse.json()).repos
+      .filter((repo) => repo.active !== false)
+      .slice(0, 25);
+    const handles = new Map<string, string>();
+
+    const pages = await Promise.all(repos.map(async ({ did }) => {
+      try {
+        const response = await fetch(
+          `${pdsUrl}/xrpc/com.atproto.repo.listRecords?repo=${encodeURIComponent(did)}&collection=app.bsky.feed.post&limit=20&reverse=true`,
+          { signal: AbortSignal.timeout(4000) }
+        );
+        if (!response.ok) return [];
+        const records = localRecordsSchema.parse(await response.json()).records;
+        let handle = handles.get(did);
+        if (!handle) {
+          handle = await this.resolveActorHandle(did);
+          handles.set(did, handle);
+        }
+        return records.flatMap((record): PostSummary[] => {
+          const value = postRecordSchema.safeParse(record.value);
+          if (!value.success || !value.data.text || !/(^|\s)#netslum(?:\s|$)/i.test(value.data.text)) return [];
+          return [{
+            uri: record.uri,
+            cid: record.cid,
+            author: { did, handle },
+            text: value.data.text,
+            createdAt: value.data.createdAt ?? new Date(0).toISOString()
+          }];
+        });
+      } catch {
+        return [];
+      }
+    }));
+
+    return pages.flat()
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .slice(0, limit);
+  }
+
+  private async finalizePublishedPost(
+    actorDid: string,
+    draftRevision: string,
+    uri: string,
+    cid: string,
+    text: string,
+    publishedAt: string
+  ): Promise<void> {
+    const handle = await this.resolveActorHandle(actorDid);
+    const optimistic: PostSummary = {
+      uri,
+      cid,
+      author: { did: actorDid, handle },
+      text,
+      createdAt: publishedAt
+    };
+    await this.env.DB.batch([
+      this.env.DB.prepare("DELETE FROM post_draft WHERE did=? AND revision=?").bind(actorDid, draftRevision),
+      this.env.DB.prepare(
+        "INSERT INTO optimistic_post(draft_revision,uri,did,cid,post_json,expires_at) VALUES(?,?,?,?,?,?) " +
+        "ON CONFLICT(draft_revision) DO UPDATE SET uri=excluded.uri,did=excluded.did,cid=excluded.cid,post_json=excluded.post_json,expires_at=excluded.expires_at"
+      ).bind(draftRevision, uri, actorDid, cid, JSON.stringify(optimistic), Date.now() + 15 * 60_000),
+      this.env.DB.prepare("DELETE FROM feed_cache WHERE cache_key LIKE 'town:%'")
+    ]);
+  }
+
   async getTownFeed(cursor?: string, limit = 5): Promise<{ posts: PostSummary[]; cursor?: string; stale: boolean }> {
     const cacheKey = `town:${cursor ?? "first"}:${limit}`;
-    const cached = await this.env.DB.prepare("SELECT response_json,fetched_at,expires_at FROM feed_cache WHERE cache_key=?").bind(cacheKey).first<FeedCacheRow>();
+    const cached = await this.env.DB.prepare(
+      "SELECT response_json,fetched_at,expires_at FROM feed_cache WHERE cache_key=?"
+    ).bind(cacheKey).first<FeedCacheRow>();
     const now = Date.now();
+    const optimistic = await this.getOptimisticPosts(cursor, limit, now);
+    const local = await this.getLocalPdsPosts(cursor, limit).catch(() => []);
+    const immediate = [...optimistic, ...local];
+
     if (cached && cached.expires_at > now) {
       const parsed = JSON.parse(cached.response_json) as { posts: PostSummary[]; cursor?: string };
-      return { ...parsed, stale: false };
+      return {
+        posts: mergeTownPosts(immediate, parsed.posts, limit),
+        ...(parsed.cursor ? { cursor: parsed.cursor } : {}),
+        stale: false
+      };
     }
+
     try {
       const agent = await this.getAgent();
-      const qParams: { q: string; sort: "latest"; limit: number; cursor?: string } = { q: "#netslum", sort: "latest", limit };
+      const qParams: { q: string; sort: "latest"; limit: number; cursor?: string } = {
+        q: "#netslum",
+        sort: "latest",
+        limit
+      };
       if (cursor) qParams.cursor = cursor;
       const response = await agent.app.bsky.feed.searchPosts(qParams, { signal: AbortSignal.timeout(5000) });
-      const posts: PostSummary[] = response.data.posts.map((post) => {
+      const authoritative: PostSummary[] = response.data.posts.map((post) => {
         const record = postRecordSchema.safeParse(post.record).data;
-        const authorObj: { did: string; handle: string; displayName?: string } = { did: post.author.did, handle: post.author.handle };
-        if (post.author.displayName) authorObj.displayName = post.author.displayName;
+        const author: { did: string; handle: string; displayName?: string } = {
+          did: post.author.did,
+          handle: post.author.handle
+        };
+        if (post.author.displayName) author.displayName = post.author.displayName;
         return {
           uri: post.uri,
           cid: post.cid,
-          author: authorObj,
+          author,
           text: record?.text ?? "",
           createdAt: record?.createdAt ?? new Date().toISOString()
         };
       });
-      const payload = JSON.stringify({ posts, cursor: response.data.cursor });
-      await this.env.DB.prepare("INSERT INTO feed_cache(cache_key,response_json,fetched_at,expires_at) VALUES(?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET response_json=excluded.response_json,fetched_at=excluded.fetched_at,expires_at=excluded.expires_at").bind(cacheKey, payload, now, now + 30_000).run();
-      const result: { posts: PostSummary[]; cursor?: string; stale: boolean } = { posts, stale: false };
-      if (response.data.cursor) result.cursor = response.data.cursor;
-      return result;
+      const payload = JSON.stringify({ posts: authoritative, cursor: response.data.cursor });
+      await this.env.DB.prepare(
+        "INSERT INTO feed_cache(cache_key,response_json,fetched_at,expires_at) VALUES(?,?,?,?) " +
+        "ON CONFLICT(cache_key) DO UPDATE SET response_json=excluded.response_json,fetched_at=excluded.fetched_at,expires_at=excluded.expires_at"
+      ).bind(cacheKey, payload, now, now + 30_000).run();
+      return {
+        posts: mergeTownPosts(immediate, authoritative, limit),
+        ...(response.data.cursor ? { cursor: response.data.cursor } : {}),
+        stale: false
+      };
     } catch {
       if (cached && cached.fetched_at + 15 * 60_000 > now) {
         const parsed = JSON.parse(cached.response_json) as { posts: PostSummary[]; cursor?: string };
-        return { ...parsed, stale: true };
+        return {
+          posts: mergeTownPosts(immediate, parsed.posts, limit),
+          ...(parsed.cursor ? { cursor: parsed.cursor } : {}),
+          stale: true
+        };
       }
+      if (immediate.length > 0) return { posts: mergeTownPosts(immediate, [], limit), stale: true };
       throw new NetslumError("UPSTREAM_UNAVAILABLE", "Public feed is temporarily unavailable", 503, true);
     }
   }
+
 
   async getProfile(actor: string): Promise<{ did: string; handle: string; displayName?: string; description?: string }> {
     const agent = await this.getAgent();
@@ -108,12 +299,37 @@ export class AtprotoService {
     const rkey = deterministicPostRkey(draftRevision);
     const agent = await this.getAgent(actorDid);
     try {
-      const existing = await agent.com.atproto.repo.getRecord({ repo: actorDid, collection: "app.bsky.feed.post", rkey });
+      const existing = await agent.com.atproto.repo.getRecord({
+        repo: actorDid,
+        collection: "app.bsky.feed.post",
+        rkey
+      });
       const record = postRecordSchema.safeParse(existing.data.value).data;
-      return { uri: existing.data.uri, cid: existing.data.cid ?? "", publishedAt: record?.createdAt ?? new Date().toISOString() };
-    } catch { /* proceed to create */ }
-    const draft = await this.env.DB.prepare("SELECT text,reply_to_uri FROM post_draft WHERE did=? AND revision=?").bind(actorDid, draftRevision).first<{ text: string; reply_to_uri: string | null }>();
+      const publishedAt = record?.createdAt ?? new Date().toISOString();
+      const cid = existing.data.cid ?? "";
+      await this.finalizePublishedPost(
+        actorDid,
+        draftRevision,
+        existing.data.uri,
+        cid,
+        record?.text ?? "",
+        publishedAt
+      );
+      return { uri: existing.data.uri, cid, publishedAt };
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes("Could not find record")) {
+        const draftStillExists = await this.env.DB.prepare(
+          "SELECT 1 AS present FROM post_draft WHERE did=? AND revision=?"
+        ).bind(actorDid, draftRevision).first<{ present: number }>();
+        if (!draftStillExists) throw error;
+      }
+    }
+
+    const draft = await this.env.DB.prepare(
+      "SELECT text,reply_to_uri FROM post_draft WHERE did=? AND revision=?"
+    ).bind(actorDid, draftRevision).first<{ text: string; reply_to_uri: string | null }>();
     if (!draft) throw new NetslumError("STALE_REVISION", "Draft was modified or published", 409);
+
     const fullText = `${draft.text}\n\n#netslum`;
     const richText = new RichText({ text: fullText });
     await richText.detectFacets(agent);
@@ -121,22 +337,46 @@ export class AtprotoService {
     if (draft.reply_to_uri) {
       const match = /^at:\/\/([^/]+)\/app\.bsky\.feed\.post\/([^/]+)$/.exec(draft.reply_to_uri);
       if (!match) throw new NetslumError("INVALID_INPUT", "Invalid reply URI", 400);
-      const parentRecord = await agent.com.atproto.repo.getRecord({ repo: match[1] ?? "", collection: "app.bsky.feed.post", rkey: match[2] ?? "" });
+      const parentRecord = await agent.com.atproto.repo.getRecord({
+        repo: match[1] ?? "",
+        collection: "app.bsky.feed.post",
+        rkey: match[2] ?? ""
+      });
       const parentVal = replyRecordSchema.safeParse(parentRecord.data.value).data;
-      const root = parentVal?.reply?.root ?? { uri: parentRecord.data.uri, cid: parentRecord.data.cid ?? "" };
-      reply = { root, parent: { uri: parentRecord.data.uri, cid: parentRecord.data.cid ?? "" } };
+      const root = parentVal?.reply?.root ?? {
+        uri: parentRecord.data.uri,
+        cid: parentRecord.data.cid ?? ""
+      };
+      reply = {
+        root,
+        parent: { uri: parentRecord.data.uri, cid: parentRecord.data.cid ?? "" }
+      };
     }
+
     const publishedAt = new Date().toISOString();
     const created = await agent.com.atproto.repo.createRecord({
-      repo: actorDid, collection: "app.bsky.feed.post", rkey,
-      record: { $type: "app.bsky.feed.post", text: richText.text, facets: richText.facets, reply, createdAt: publishedAt }
+      repo: actorDid,
+      collection: "app.bsky.feed.post",
+      rkey,
+      record: {
+        $type: "app.bsky.feed.post",
+        text: richText.text,
+        facets: richText.facets,
+        reply,
+        createdAt: publishedAt
+      }
     });
-    await this.env.DB.batch([
-      this.env.DB.prepare("DELETE FROM post_draft WHERE did=?").bind(actorDid),
-      this.env.DB.prepare("INSERT INTO optimistic_post(draft_revision,uri,did,cid,post_json,expires_at) VALUES(?,?,?,?,?,?) ON CONFLICT(draft_revision) DO NOTHING").bind(draftRevision, created.data.uri, actorDid, created.data.cid, JSON.stringify({ uri: created.data.uri, cid: created.data.cid, author: { did: actorDid, handle: actorDid }, text: fullText, createdAt: publishedAt }), Date.now() + 15 * 60_000)
-    ]);
+    await this.finalizePublishedPost(
+      actorDid,
+      draftRevision,
+      created.data.uri,
+      created.data.cid,
+      fullText,
+      publishedAt
+    );
     return { uri: created.data.uri, cid: created.data.cid, publishedAt };
   }
+
 
   async reactToPost(actorDid: string, input: { uri: string; cid: string; action: "like" | "unlike" | "repost" | "unrepost" }): Promise<{ action: string; uri: string; active: boolean }> {
     const isLike = input.action === "like" || input.action === "unlike";
