@@ -133,7 +133,7 @@ export class SiteService {
   }
 
   async listFiles(siteId: string, prefix: string): Promise<SiteFile[]> {
-    const listed = await this.env.SITE_FILES.list({ prefix: prefix.endsWith("/") ? prefix : `${prefix}/` });
+    const listed = await this.env.SITE_FILES.list({ prefix: prefix.endsWith("/") ? prefix : `${prefix}/`, include: ["customMetadata"] });
     const files: SiteFile[] = [];
     for (const object of listed.objects) {
       const path = object.key.slice(prefix.length + 1);
@@ -464,7 +464,8 @@ export class SiteService {
           "UPDATE site_release SET status = 'superseded' WHERE did = ? AND status = 'active'"
         ).bind(actorDid),
         this.env.DB.prepare(
-          "INSERT INTO site_release(did, revision, worker_name, status, created_at, published_at) VALUES(?, ?, ?, 'active', ?, ?)"
+          "INSERT INTO site_release(did, revision, worker_name, status, created_at, published_at) VALUES(?, ?, ?, 'active', ?, ?) " +
+          "ON CONFLICT(did, revision) DO UPDATE SET status = 'active', worker_name = excluded.worker_name, published_at = excluded.published_at"
         ).bind(actorDid, input.revision, productionWorkerName, now, Date.now())
       ]);
 
