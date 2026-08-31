@@ -74,7 +74,7 @@ export function App() {
   const [handledStatusNonce, setHandledStatusNonce] = useState(0);
   useInitDataChanged((next) => {
     const updated = next as InitData;
-    setData(updated);
+    setData((current) => ({ ...current, ...updated }));
     if (!updated.actionStatus) return;
     try {
       const status = JSON.parse(updated.actionStatus) as ActionStatus;

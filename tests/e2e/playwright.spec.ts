@@ -22,6 +22,17 @@ test.describe("Netslum E2E Browser & API Suite", () => {
     expect(text).toContain("netslum");
   });
 
+  test("keeps route state while asynchronous town data updates arrive", async ({ page }) => {
+    await page.goto("/town");
+    await page.waitForFunction(() => {
+      const text = document.querySelector("lynx-view")?.shadowRoot?.textContent ?? "";
+      return text.includes("TOWN SQUARE") && text.includes("#netslum public commons");
+    });
+    const text = await page.evaluate(() => document.querySelector("lynx-view")?.shadowRoot?.textContent);
+    expect(text).toContain("TOWN SQUARE");
+    expect(text).not.toContain("the network remembers what we make together");
+  });
+
   test("registers WebMCP tools and executes public tool handlers", async ({ page }) => {
     await page.addInitScript(() => {
       const registered = new Map<string, unknown>();
