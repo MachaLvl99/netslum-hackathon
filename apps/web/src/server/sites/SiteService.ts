@@ -46,6 +46,22 @@ export class SiteService {
     this.provisioner = new CloudflareProvisioner(env);
   }
 
+  private async resolveActorHandle(actorDid: string): Promise<string> {
+    if (actorDid.startsWith("did:plc:")) {
+      const response = await fetch(`https://plc.directory/${encodeURIComponent(actorDid)}`, { signal: AbortSignal.timeout(4000) });
+      if (!response.ok) throw new NetslumError("UPSTREAM_UNAVAILABLE", "Identity resolver unavailable", 503, true);
+      const document = await response.json<{ alsoKnownAs?: string[] }>();
+      const alias = document.alsoKnownAs?.find((value) => value.startsWith("at://"));
+      if (alias) return alias.slice("at://".length);
+      throw new NetslumError("INVALID_HANDLE", "Account has no handle for a site slug", 400);
+    }
+    if (actorDid.startsWith("did:web:")) {
+      const segments = actorDid.slice("did:web:".length).split(":").map(decodeURIComponent);
+      return segments[0] ?? actorDid;
+    }
+    throw new NetslumError("FORBIDDEN", "Unsupported DID method", 403);
+  }
+
   private async getAgent(actorDid: string): Promise<Agent> {
     const client = await getOAuthClient(this.env);
     const session = await client.restore(actorDid).catch(() => undefined);
@@ -66,7 +82,7 @@ export class SiteService {
     const existing = await this.env.DB.prepare("SELECT * FROM site WHERE did = ?").bind(actorDid).first<SiteRow>();
     if (existing) return { siteId, site: existing };
 
-    const firstLabel = handle ? handle.split(".")[0] : undefined;
+    const firstLabel = (handle ?? (await this.resolveActorHandle(actorDid))).split(".")[0];
     if (!firstLabel || !slugSchema.safeParse(firstLabel).success) {
       throw new NetslumError("INVALID_HANDLE", "Handle label is invalid for personal site slug", 400);
     }

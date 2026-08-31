@@ -13,6 +13,8 @@ interface InitData {
   routeError?: string;
   feedStale?: boolean;
   lastUpdatedAt?: number;
+  editorChunk?: string;
+  editorRevision?: string;
 }
 
 interface PostItem {
@@ -51,10 +53,14 @@ declare let NativeModules: {
     logout(): void;
     postMessage(text: string): void;
     placeZoneNote(zoneKey: string, text: string): void;
+    readSiteFile(path: string, revision: string, offset: number): void;
     saveSiteFile(path: string, content: string, revision?: string): void;
     publishSite(revision: string): void;
   };
 };
+
+const EDITOR_CHUNK_CHARS = 1000;
+
 
 const FEATURED_ZONES = [
   "hidden.archive.echo",
@@ -71,10 +77,35 @@ export function App() {
   const [postText, setPostText] = useState("");
   const [noteText, setNoteText] = useState("");
   const [editorText, setEditorText] = useState("");
+  const [editorPath, setEditorPath] = useState("index.html");
+  const [editorNextOffset, setEditorNextOffset] = useState(0);
+  const [editorLoadedChars, setEditorLoadedChars] = useState(0);
+  const [editorBaseRevision, setEditorBaseRevision] = useState("");
+  const [sitePublishedUrl, setSitePublishedUrl] = useState("");
   const [handledStatusNonce, setHandledStatusNonce] = useState(0);
   useInitDataChanged((next) => {
     const updated = next as InitData;
     setData((current) => ({ ...current, ...updated }));
+
+    if (updated.editorChunk) {
+      try {
+        const chunk = JSON.parse(updated.editorChunk) as { path: string; content: string; revision: string; nextOffset?: number };
+        if (chunk.path === editorPath) {
+          if (editorLoadedChars === 0 || chunk.revision !== editorBaseRevision) {
+            setEditorText(chunk.content);
+            setEditorLoadedChars(chunk.content.length);
+          } else {
+            setEditorText((current) => current + chunk.content);
+            setEditorLoadedChars((current) => current + chunk.content.length);
+          }
+          setEditorBaseRevision(chunk.revision);
+        }
+      } catch (error) {
+        void error;
+      }
+      return;
+    }
+
     if (!updated.actionStatus) return;
     try {
       const status = JSON.parse(updated.actionStatus) as ActionStatus;
@@ -82,6 +113,12 @@ export function App() {
       setHandledStatusNonce(status.nonce);
       if (status.state === "success" && status.action === "post") setPostText("");
       if (status.state === "success" && status.action === "zone") setNoteText("");
+      if (status.state === "success" && status.action === "site" && status.message.startsWith("Site published")) {
+        setSitePublishedUrl(status.message);
+      }
+      if (status.state === "success" && status.action === "site" && updated.editorRevision) {
+        setEditorBaseRevision(updated.editorRevision);
+      }
     } catch (error) {
       void error;
     }
@@ -116,6 +153,42 @@ export function App() {
     if (!noteText.trim() || noteText.length > 280) return;
     try {
       NativeModules.NetslumHost.placeZoneNote(zoneKey, noteText);
+    } catch (error) {
+      void error;
+    }
+  };
+
+  const openFile = (path: string): void => {
+    setEditorPath(path);
+    setEditorNextOffset(0);
+    setEditorLoadedChars(0);
+    setEditorText("");
+    try {
+      NativeModules.NetslumHost.readSiteFile(path, "", 0);
+    } catch (error) {
+      void error;
+    }
+  };
+
+  const loadMoreEditor = (): void => {
+    try {
+      NativeModules.NetslumHost.readSiteFile(editorPath, "", editorLoadedChars);
+    } catch (error) {
+      void error;
+    }
+  };
+
+  const saveFile = (): void => {
+    try {
+      NativeModules.NetslumHost.saveSiteFile(editorPath, editorText, editorBaseRevision || siteRevision);
+    } catch (error) {
+      void error;
+    }
+  };
+
+  const publishSite = (): void => {
+    try {
+      NativeModules.NetslumHost.publishSite(editorBaseRevision || siteRevision);
     } catch (error) {
       void error;
     }
@@ -329,42 +402,40 @@ export function App() {
           </view>
         ) : route === "/studio" ? (
           <view className="content">
-            <text className="kicker">PERSONAL SITE STUDIO // @{siteSlug}</text>
+            <text className="kicker">PERSONAL SITE STUDIO // @{siteSlug || "loading"}</text>
             <text className="title">programmable page editor</text>
             <text className="copy">Draft Revision: {siteRevision.slice(0, 16) || "none"}</text>
+            {data.routeError ? <text className="stale-label">{data.routeError}</text> : null}
 
             <view className="studio-container">
               <view className="file-tree">
                 <text className="tree-header">FILES ({siteFiles.length})</text>
                 {siteFiles.map(f => (
-                  <text key={f.path} className="file-item">&bull; {f.path} ({f.size} B)</text>
+                  <view key={f.path} className={editorPath === f.path ? "file-item file-item-active" : "file-item"} bindtap={() => openFile(f.path)}>
+                    <text className="file-item-text">&bull; {f.path}</text>
+                    <text className="file-item-size">{f.size} B</text>
+                  </view>
                 ))}
               </view>
 
               <view className="editor-panel">
-                <text className="editor-label">EDIT index.html</text>
+                <text className="editor-label">EDITING {editorPath || "index.html"}</text>
                 <input
                   className="editor-input"
                   placeholder="<h1>Welcome to my Net Slum site</h1>"
                   value={editorText}
                   bindinput={(e: LynxInputEvent) => setEditorText(e.detail.value)}
                 />
+                {editorNextOffset ? (
+                  <text className="stale-label" bindtap={loadMoreEditor}>FILE TRUNCATED // TAP TO LOAD NEXT {EDITOR_CHUNK_CHARS} CHARS</text>
+                ) : null}
                 <view className="editor-actions">
-                  <text className="primary-sm" bindtap={() => {
-                    try {
-                      NativeModules.NetslumHost.saveSiteFile("index.html", editorText || "<h1>Welcome to netslum</h1>", siteRevision);
-                    } catch (e) {
-                      void e;
-                    }
-                  }}>SAVE DRAFT</text>
-                  <text className="secondary-sm" bindtap={() => {
-                    try {
-                      NativeModules.NetslumHost.publishSite(siteRevision);
-                    } catch (e) {
-                      void e;
-                    }
-                  }}>PUBLISH SITE LIVE</text>
+                  <text className={siteBusy ? "primary-sm busy" : "primary-sm"} bindtap={saveFile}>SAVE DRAFT</text>
+                  <text className="secondary-sm" bindtap={publishSite}>PUBLISH SITE LIVE</text>
                 </view>
+                {sitePublishedUrl ? (
+                  <text className="stale-label">PUBLISHED // {sitePublishedUrl}</text>
+                ) : null}
               </view>
             </view>
           </view>

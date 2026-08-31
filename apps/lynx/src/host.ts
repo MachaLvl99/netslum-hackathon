@@ -21,6 +21,14 @@ interface ZonePayload {
   objects: unknown[];
 }
 
+interface SiteFileRead {
+  path: string;
+  content: string;
+  encoding: "utf8" | "base64";
+  revision: string;
+  nextOffset?: number;
+}
+
 class ApiFailure extends Error {
   constructor(
     readonly status: number,
@@ -41,6 +49,7 @@ const bridgeModuleUrl = URL.createObjectURL(new Blob([
       logout() { return nativeModulesCall("logout", {}); },
       postMessage(text) { return nativeModulesCall("postMessage", { text }); },
       placeZoneNote(zoneKey, text) { return nativeModulesCall("placeZoneNote", { zoneKey, text }); },
+      readSiteFile(path, revision, offset) { return nativeModulesCall("readSiteFile", { path, revision, offset }); },
       saveSiteFile(path, content, revision) { return nativeModulesCall("saveSiteFile", { path, content, revision }); },
       publishSite(revision) { return nativeModulesCall("publishSite", { revision }); }
     };
@@ -190,8 +199,13 @@ const syncRoute = async (): Promise<void> => {
   if (zoneKey) await refreshZone(zoneKey);
   if (pathname === "/studio" && session.authenticated) {
     try {
-      const site = await apiJson<unknown>("/api/sites/draft");
+      const site = await apiJson<{ slug: string; revision: string; files: Array<{ path: string }> }>("/api/sites/draft");
       view.updateData({ site: JSON.stringify(site), routeError: "", lastUpdatedAt: Date.now() });
+      const indexFile = site.files.find((file) => file.path === "index.html") ?? site.files[0];
+      if (indexFile) {
+        const file = await apiJson<SiteFileRead>(`/api/sites/file?path=${encodeURIComponent(indexFile.path)}&offset=0&maxChars=1000`);
+        view.updateData({ editorChunk: JSON.stringify(file) });
+      }
     } catch (error) {
       view.updateData({ routeError: describeFailure(error), lastUpdatedAt: Date.now() });
     }
@@ -291,10 +305,20 @@ view.onNativeModulesCall = async (name, data, moduleName) => {
     return;
   }
 
+  if (name === "readSiteFile" && typeof input?.path === "string" && typeof input?.offset === "number") {
+    try {
+      const file = await apiJson<SiteFileRead>(`/api/sites/file?path=${encodeURIComponent(input.path)}&offset=${input.offset}&maxChars=1000`);
+      view.updateData({ editorChunk: JSON.stringify(file) });
+    } catch (error) {
+      setStatus("site", "error", describeFailure(error));
+    }
+    return;
+  }
+
   if (name === "saveSiteFile" && typeof input?.path === "string" && typeof input?.content === "string" && typeof input?.revision === "string") {
     setStatus("site", "busy", `Saving ${input.path}…`);
     try {
-      await apiJson("/api/sites/file", {
+      const saved = await apiJson<{ revision: string }>("/api/sites/file", {
         method: "PUT",
         headers: mutationHeaders(),
         body: JSON.stringify({
@@ -306,6 +330,7 @@ view.onNativeModulesCall = async (name, data, moduleName) => {
         })
       });
       setStatus("site", "success", `${input.path} saved`);
+      view.updateData({ editorRevision: saved.revision, editorChunk: "" });
       await syncRoute();
     } catch (error) {
       setStatus("site", "error", describeFailure(error));
@@ -316,12 +341,12 @@ view.onNativeModulesCall = async (name, data, moduleName) => {
   if (name === "publishSite" && typeof input?.revision === "string") {
     setStatus("site", "busy", "Publishing site…");
     try {
-      await apiJson("/api/sites/publish", {
+      const published = await apiJson<{ url: string }>("/api/sites/publish", {
         method: "POST",
         headers: mutationHeaders(),
         body: JSON.stringify({ revision: input.revision })
       });
-      setStatus("site", "success", "Site published");
+      setStatus("site", "success", `Site published — ${published.url}`);
       await syncRoute();
     } catch (error) {
       setStatus("site", "error", describeFailure(error));
