@@ -154,7 +154,8 @@ export function registerNetslumTools(
         cursor: { type: "string", maxLength: 512, description: "Pagination cursor" },
         limit: { type: "integer", minimum: 1, maximum: 5, description: "Page limit (1..5)" }
       },
-      additionalProperties: false
+      additionalProperties: false,
+      required: []
     },
     annotations: { readOnlyHint: true, untrustedContentHint: true },
     execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
@@ -390,7 +391,7 @@ export function registerNetslumTools(
   void document.modelContext.registerTool({
     name: "open_site_editor",
     description: "Open the Studio editor and inspect draft files.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    inputSchema: { type: "object", properties: {}, additionalProperties: false, required: [] },
     annotations: { readOnlyHint: true, untrustedContentHint: true },
     execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
       try {
