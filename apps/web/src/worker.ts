@@ -86,10 +86,22 @@ app.get("/.well-known/jwks.json", async (c) => {
 
 // OAuth Login initiation
 app.get("/oauth/login", async (c) => {
-  const handle = c.req.query("handle") ?? c.env.PDS_HOSTNAME ?? "pds.netslum.macha.sh";
+  let target = (c.req.query("handle") ?? "").trim();
+  const pdsUrl = c.env.PDS_URL ?? "https://pds.netslum.macha.sh";
+  const pdsHost = c.env.PDS_HOSTNAME ?? "pds.netslum.macha.sh";
+
+  if (!target || target === pdsHost || target === pdsUrl) {
+    target = pdsUrl;
+  } else if (!target.startsWith("did:") && !target.startsWith("http://") && !target.startsWith("https://")) {
+    target = target.replace(/^@/, "");
+    if (!target.includes(".")) {
+      target = `${target}.${pdsHost}`;
+    }
+  }
+
   const client = await getOAuthClient(c.env);
   const state = crypto.randomUUID();
-  const url = await client.authorize(handle, { state });
+  const url = await client.authorize(target, { state });
   return c.redirect(url.toString(), 302);
 });
 
