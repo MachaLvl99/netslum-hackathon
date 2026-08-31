@@ -1,6 +1,6 @@
 import type { LynxViewElement } from "@lynx-js/web-core/client";
+import { renderZoneScene, sceneParamsFromSeed, zoneKeySeed, type SceneObject } from "./scene.js";
 import { registerNetslumTools, type SessionInfo } from "./webmcp.js";
-
 interface ApiErrorPayload {
   code?: string;
   message?: string;
@@ -57,10 +57,89 @@ const bridgeModuleUrl = URL.createObjectURL(new Blob([
 ], { type: "text/javascript" }));
 
 view.style.cssText = "display:block;width:100vw;height:100vh";
-view.initData = { route: location.pathname, authenticated: false, canPublishSite: false };
+view.initData = { route: location.pathname, authenticated: false, canPublishSite: false, compactViewport: window.innerWidth <= 800 };
 view.nativeModulesMap = { NetslumHost: bridgeModuleUrl };
 view.setAttribute("url", "/main.web.bundle");
+
+// Zone scene canvas: host-owned 2D canvas behind the Lynx view (plan §4.8).
+// The Lynx view keeps the synchronized semantic object list.
+const zoneCanvas = document.createElement("canvas");
+zoneCanvas.id = "netslum-zone-canvas";
+zoneCanvas.style.cssText = "position:fixed;inset:0;width:100vw;height:100vh;z-index:0;pointer-events:none";
+document.body.append(zoneCanvas);
+host.style.position = "relative";
+host.style.zIndex = "1";
+const zoneCtx = zoneCanvas.getContext("2d");
+const sceneSeeds = new Map<string, string>();
+let sceneKey = "";
+let sceneDrawGeneration = 0;
+
+function updateZoneScene(zoneKey: string, objects: unknown[]): void {
+  if (!zoneCtx) return;
+  sceneKey = zoneKey;
+  document.body.classList.toggle("zone-route", true);
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.floor(window.innerWidth);
+  const height = Math.floor(window.innerHeight);
+  if (zoneCanvas.width !== width * dpr || zoneCanvas.height !== height * dpr) {
+    zoneCanvas.width = width * dpr;
+    zoneCanvas.height = height * dpr;
+  }
+  const drawId = ++sceneDrawGeneration;
+  void (async () => {
+    let seed = sceneSeeds.get(zoneKey);
+    if (!seed) {
+      seed = await zoneKeySeed(zoneKey);
+      sceneSeeds.set(zoneKey, seed);
+    }
+    if (sceneKey !== zoneKey || drawId !== sceneDrawGeneration) return;
+    zoneCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    renderZoneScene(zoneCtx, zoneKey, seed, sceneParamsFromSeed(seed, width), objects as SceneObject[], width, height);
+  })();
+}
+
+function clearZoneScene(): void {
+  sceneKey = "";
+  document.body.classList.toggle("zone-route", false);
+  if (zoneCtx) zoneCtx.clearRect(0, 0, zoneCanvas.width, zoneCanvas.height);
+}
+
+window.addEventListener("resize", () => {
+  if (sceneKey) updateZoneScene(sceneKey, latestZone?.zoneKey === sceneKey ? latestZone.objects : []);
+  pushData({ compactViewport: window.innerWidth <= 800 });
+});
 host.append(view);
+
+// view.updateData crashes with "reading 'enableJSDataProcessor'" when the
+// Lynx page config has not loaded yet (race between instance attach and
+// first page load). Queue updates until the first successful dispatch.
+let viewReady = false;
+const pendingUpdates: Array<Record<string, unknown>> = [];
+function pushData(data: Record<string, unknown>): void {
+  if (!viewReady) {
+    pendingUpdates.push(data);
+    return;
+  }
+  view.updateData(data);
+}
+function flushPendingData(): void {
+  while (pendingUpdates.length > 0) {
+    view.updateData(pendingUpdates.shift() as Record<string, unknown>);
+  }
+}
+
+// Probe until the view accepts updates (page config loaded), then flush.
+const readyProbe = (): void => {
+  const probe = () => view.updateData({ lastUpdatedAt: Date.now() });
+  try {
+    probe();
+    viewReady = true;
+    flushPendingData();
+  } catch {
+    setTimeout(readyProbe, 200);
+  }
+};
+setTimeout(readyProbe, 400);
 
 let currentToolAbort: AbortController | null = null;
 let routeGeneration = 0;
@@ -92,7 +171,7 @@ async function apiJson<T>(input: RequestInfo | URL, init?: RequestInit): Promise
 
 function setStatus(action: ActionStatus["action"], state: ActionStatus["state"], message: string): void {
   const status: ActionStatus = { action, state, message, nonce: Date.now() };
-  view.updateData({ actionStatus: JSON.stringify(status) });
+  pushData({ actionStatus: JSON.stringify(status) });
 }
 
 function describeFailure(error: unknown): string {
@@ -111,14 +190,14 @@ function zoneKeyForPath(pathname: string): string | null {
 async function refreshTown(): Promise<void> {
   try {
     const feed = await apiJson<{ posts: unknown[]; cursor?: string; stale: boolean }>("/api/feed?limit=5");
-    view.updateData({
+    pushData({
       feed: JSON.stringify(feed),
       feedStale: feed.stale,
       routeError: "",
       lastUpdatedAt: Date.now()
     });
   } catch (error) {
-    view.updateData({ routeError: describeFailure(error), lastUpdatedAt: Date.now() });
+    pushData({ routeError: describeFailure(error), lastUpdatedAt: Date.now() });
   }
 }
 
@@ -126,9 +205,10 @@ async function refreshZone(zoneKey: string): Promise<void> {
   try {
     const zone = await apiJson<ZonePayload>(`/api/zones/${encodeURIComponent(zoneKey)}`);
     latestZone = zone;
-    view.updateData({ zone: JSON.stringify(zone), routeError: "", lastUpdatedAt: Date.now() });
+    updateZoneScene(zoneKey, zone.objects);
+    pushData({ zone: JSON.stringify(zone), routeError: "", lastUpdatedAt: Date.now() });
   } catch (error) {
-    view.updateData({ routeError: describeFailure(error), lastUpdatedAt: Date.now() });
+    pushData({ routeError: describeFailure(error), lastUpdatedAt: Date.now() });
   }
 }
 
@@ -155,7 +235,8 @@ function connectZoneSocket(zoneKey: string): void {
       const message = JSON.parse(String(event.data)) as { type?: string; zoneKey?: string; version?: number; objects?: unknown[] };
       if ((message.type === "snapshot" || message.type === "mutation") && message.zoneKey === zoneKey && typeof message.version === "number" && Array.isArray(message.objects)) {
         latestZone = { zoneKey, version: message.version, objects: message.objects };
-        view.updateData({ zone: JSON.stringify(latestZone), routeError: "", lastUpdatedAt: Date.now() });
+        updateZoneScene(zoneKey, message.objects);
+        pushData({ zone: JSON.stringify(latestZone), routeError: "", lastUpdatedAt: Date.now() });
       }
     } catch (error) {
       console.error("Invalid zone socket message", error);
@@ -185,29 +266,41 @@ const syncRoute = async (): Promise<void> => {
   try {
     session = await apiJson<SessionInfo>("/api/session");
   } catch (error) {
-    view.updateData({ routeError: describeFailure(error) });
+    pushData({ routeError: describeFailure(error) });
   }
   if (generation !== routeGeneration) return;
 
   currentToolAbort?.abort();
   currentToolAbort = new AbortController();
   registerNetslumTools(navigate, session, currentToolAbort.signal);
-  view.updateData({ route: pathname, ...session, routeError: "" });
+  pushData({ route: pathname, ...session, routeError: "" });
 
   if (pathname === "/" || pathname === "/town") await refreshTown();
   const zoneKey = zoneKeyForPath(pathname);
   if (zoneKey) await refreshZone(zoneKey);
+  else clearZoneScene();
+  if (pathname.startsWith("/profile/") && session.authenticated !== undefined) {
+    const actor = decodeURIComponent(pathname.slice("/profile/".length));
+    try {
+      const profile = await apiJson<{ did: string; handle: string; displayName?: string; description?: string; siteUrl?: string | null }>(
+        `/api/profile/${encodeURIComponent(actor)}`
+      );
+      pushData({ profile: JSON.stringify(profile), routeError: "", lastUpdatedAt: Date.now() });
+    } catch (error) {
+      pushData({ profile: "", routeError: describeFailure(error), lastUpdatedAt: Date.now() });
+    }
+  }
   if (pathname === "/studio" && session.authenticated) {
     try {
       const site = await apiJson<{ slug: string; revision: string; files: Array<{ path: string }> }>("/api/sites/draft");
-      view.updateData({ site: JSON.stringify(site), routeError: "", lastUpdatedAt: Date.now() });
+      pushData({ site: JSON.stringify(site), routeError: "", lastUpdatedAt: Date.now() });
       const indexFile = site.files.find((file) => file.path === "index.html") ?? site.files[0];
       if (indexFile) {
         const file = await apiJson<SiteFileRead>(`/api/sites/file?path=${encodeURIComponent(indexFile.path)}&offset=0&maxChars=1000`);
-        view.updateData({ editorChunk: JSON.stringify(file) });
+        pushData({ editorChunk: JSON.stringify(file) });
       }
     } catch (error) {
-      view.updateData({ routeError: describeFailure(error), lastUpdatedAt: Date.now() });
+      pushData({ routeError: describeFailure(error), lastUpdatedAt: Date.now() });
     }
   }
   if (generation === routeGeneration) startLiveUpdates(pathname);
@@ -215,7 +308,7 @@ const syncRoute = async (): Promise<void> => {
 
 const navigate = (route: string): void => {
   if (!route.startsWith("/")) return;
-  if (route === "/oauth/login") {
+  if (route === "/oauth/login" || route.startsWith("/@")) {
     location.assign(route);
     return;
   }
@@ -308,7 +401,7 @@ view.onNativeModulesCall = async (name, data, moduleName) => {
   if (name === "readSiteFile" && typeof input?.path === "string" && typeof input?.offset === "number") {
     try {
       const file = await apiJson<SiteFileRead>(`/api/sites/file?path=${encodeURIComponent(input.path)}&offset=${input.offset}&maxChars=1000`);
-      view.updateData({ editorChunk: JSON.stringify(file) });
+      pushData({ editorChunk: JSON.stringify(file) });
     } catch (error) {
       setStatus("site", "error", describeFailure(error));
     }
@@ -330,7 +423,7 @@ view.onNativeModulesCall = async (name, data, moduleName) => {
         })
       });
       setStatus("site", "success", `${input.path} saved`);
-      view.updateData({ editorRevision: saved.revision, editorChunk: "" });
+      pushData({ editorRevision: saved.revision, editorChunk: "" });
       await syncRoute();
     } catch (error) {
       setStatus("site", "error", describeFailure(error));
@@ -356,7 +449,7 @@ view.onNativeModulesCall = async (name, data, moduleName) => {
 
 window.addEventListener("netslum:state", (event) => {
   const detail = (event as CustomEvent<{ action: string; data: unknown }>).detail;
-  view.updateData({ lastAction: detail.action, actionData: JSON.stringify(detail.data) });
+  pushData({ lastAction: detail.action, actionData: JSON.stringify(detail.data) });
   if (location.pathname === "/town") void refreshTown();
 });
 window.addEventListener("popstate", () => void syncRoute());

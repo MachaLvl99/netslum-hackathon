@@ -150,7 +150,10 @@ app.get("/api/profile/:actor", async (c) => {
   const actor = decodeURIComponent(c.req.param("actor"));
   const service = new AtprotoService(c.env);
   const profile = await service.getProfile(actor);
-  return c.json(profile);
+  const site = await c.env.DB.prepare(
+    "SELECT slug, active_revision FROM site WHERE did = ? AND status = 'active' AND active_revision IS NOT NULL"
+  ).bind(profile.did).first<{ slug: string }>();
+  return c.json({ ...profile, siteUrl: site ? `/@${site.slug}` : null });
 });
 
 app.put("/api/post-draft", async (c) => {

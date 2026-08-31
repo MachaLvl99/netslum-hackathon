@@ -9,9 +9,11 @@ interface InitData {
   feed?: string;
   zone?: string;
   site?: string;
+  profile?: string;
   actionStatus?: string;
   routeError?: string;
   feedStale?: boolean;
+  compactViewport?: boolean;
   lastUpdatedAt?: number;
   editorChunk?: string;
   editorRevision?: string;
@@ -76,8 +78,9 @@ export function App() {
   const [data, setData] = useState<InitData>(initial);
   const [postText, setPostText] = useState("");
   const [noteText, setNoteText] = useState("");
-  const [editorText, setEditorText] = useState("");
+  const [activePane, setActivePane] = useState<"world" | "feed">("world");
   const [editorPath, setEditorPath] = useState("index.html");
+  const [editorText, setEditorText] = useState("");
   const [editorNextOffset, setEditorNextOffset] = useState(0);
   const [editorLoadedChars, setEditorLoadedChars] = useState(0);
   const [editorBaseRevision, setEditorBaseRevision] = useState("");
@@ -233,6 +236,13 @@ export function App() {
     void e;
   }
 
+  let profile: { did: string; handle: string; displayName?: string; description?: string; siteUrl?: string | null } | null = null;
+  try {
+    if (data.profile) profile = JSON.parse(data.profile) as { did: string; handle: string; displayName?: string; description?: string; siteUrl?: string | null };
+  } catch (e) {
+    void e;
+  }
+
   let actionStatus: ActionStatus | null = null;
   try {
     if (data.actionStatus) actionStatus = JSON.parse(data.actionStatus) as ActionStatus;
@@ -241,9 +251,12 @@ export function App() {
   }
   const postBusy = actionStatus?.action === "post" && actionStatus.state === "busy";
   const zoneBusy = actionStatus?.action === "zone" && actionStatus.state === "busy";
+  const siteBusy = actionStatus?.action === "site" && actionStatus.state === "busy";
+  const compact = data.compactViewport === true;
+  const onZoneRoute = route === "/gate" || route.startsWith("/zone/");
 
   return (
-    <page className="page">
+    <page className={onZoneRoute ? "page page-zone" : "page"}>
       <view className="shell">
         <view className="header">
           <text className="wordmark" accessibility-label="netslum home" bindtap={() => navigate("/")}>netslum</text>
@@ -307,10 +320,28 @@ export function App() {
             </view>
           </view>
         ) : route === "/town" ? (
-          <view className="content">
-            <text className="kicker">TOWN SQUARE // FEDERATED FEED</text>
-            <text className="title">#netslum public commons</text>
-            {data.feedStale ? <text className="stale-label">LIVE INDEX DELAYED // SHOWING RECENT LOCAL ACTIVITY</text> : null}
+          <view className={compact ? "split-layout compact" : "split-layout"}>
+            {compact ? (
+              <view className="pane-tabs">
+                <text className={activePane === "world" ? "pane-tab active" : "pane-tab"} bindtap={() => setActivePane("world")}>WORLD</text>
+                <text className={activePane === "feed" ? "pane-tab active" : "pane-tab"} bindtap={() => setActivePane("feed")}>FEED</text>
+              </view>
+            ) : null}
+            <view className={activePane === "world" || !compact ? "split-world" : "split-world pane-hidden"}>
+              <text className="kicker">TOWN SQUARE // WORLD</text>
+              <text className="title">#netslum public commons</text>
+              <view className="portal-grid">
+                {FEATURED_ZONES.map((z) => (
+                  <view key={z} className="portal-card" bindtap={() => navigate(`/zone/${z}`)}>
+                    <text className="portal-name">&Delta; {z}</text>
+                    <text className="portal-desc">Warp directly into sector</text>
+                  </view>
+                ))}
+              </view>
+            </view>
+            <view className={activePane === "feed" || !compact ? "split-feed" : "split-feed pane-hidden"}>
+              <text className="kicker">LIVE FEED RAIL</text>
+              {data.feedStale ? <text className="stale-label">LIVE INDEX DELAYED // SHOWING RECENT LOCAL ACTIVITY</text> : null}
             
             {data.authenticated ? (
               <view className="composer-card">
@@ -350,12 +381,23 @@ export function App() {
               )}
             </view>
           </view>
+          </view>
         ) : route === "/gate" || route.startsWith("/zone/") ? (
-          <view className="content">
-            <text className="kicker">CHAOS GATE // SPATIAL SECTOR</text>
-            <text className="title">&Delta; {activeZoneKey}</text>
-            <text className="copy">State Version {zoneVersion} &bull; {zoneObjects.length} Objects Active</text>
-
+          <view className={compact ? "split-layout compact" : "split-layout"}>
+            {compact ? (
+              <view className="pane-tabs">
+                <text className={activePane === "world" ? "pane-tab active" : "pane-tab"} bindtap={() => setActivePane("world")}>WORLD</text>
+                <text className={activePane === "feed" ? "pane-tab active" : "pane-tab"} bindtap={() => setActivePane("feed")}>FEED</text>
+              </view>
+            ) : null}
+            <view className={activePane === "world" || !compact ? "split-world" : "split-world pane-hidden"}>
+              <text className="kicker">CHAOS GATE // WORLD</text>
+              <text className="title">&Delta; {activeZoneKey}</text>
+              <text className="copy">State Version {zoneVersion} &bull; {zoneObjects.length} Objects Active</text>
+              <text className="zone-scene-hint">DETERMINISTIC SECTOR RENDER // SHA-256 SEEDED // ALL TRAVELERS SEE THE SAME SPACE</text>
+            </view>
+            <view className={activePane === "feed" || !compact ? "split-feed" : "split-feed pane-hidden"}>
+              <text className="kicker">SECTOR RAIL</text>
             <view className="zone-grid-view">
               <text className="section-title">// DROPPED NOTES & ARTIFACTS</text>
               <view className="objects-grid">
@@ -400,6 +442,7 @@ export function App() {
               </view>
             </view>
           </view>
+          </view>
         ) : route === "/studio" ? (
           <view className="content">
             <text className="kicker">PERSONAL SITE STUDIO // @{siteSlug || "loading"}</text>
@@ -438,6 +481,27 @@ export function App() {
                 ) : null}
               </view>
             </view>
+          </view>
+        ) : route.startsWith("/profile/") ? (
+          <view className="content">
+            <text className="kicker">AT PROTOCOL IDENTITY</text>
+            {profile ? (
+              <view className="profile-card">
+                <text className="title">@{profile.handle}</text>
+                {profile.displayName ? <text className="profile-name">{profile.displayName}</text> : null}
+                {profile.description ? <text className="profile-desc">{profile.description}</text> : null}
+                <text className="profile-did">did: {profile.did}</text>
+                {profile.siteUrl ? (
+                  <text className="primary" bindtap={() => navigate(profile.siteUrl ?? "")}>
+                    VISIT NETSLUM PAGE {profile.siteUrl} &rarr;
+                  </text>
+                ) : (
+                  <text className="profile-desc">No published netslum page.</text>
+                )}
+              </view>
+            ) : (
+              <text className="copy">{data.routeError || "Resolving identity…"}</text>
+            )}
           </view>
         ) : (
           <view className="content">

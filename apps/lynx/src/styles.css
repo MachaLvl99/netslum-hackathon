@@ -418,3 +418,119 @@ page, .page {
   .studio-container { flex-direction: column; }
   .file-tree { width: 100%; }
 }
+
+/* ZONE SCENE — canvas sits behind a transparent page; panels stay opaque */
+.page-zone {
+  background-color: transparent !important;
+}
+
+.page-zone .shell {
+  background-color: transparent !important;
+  background-image: none !important;
+}
+
+.zone-scene-hint {
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 1px;
+  margin-bottom: 8px;
+}
+
+/* PROFILE */
+.profile-card {
+  margin: 12px 0;
+  padding: 20px;
+  background-color: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.profile-name {
+  color: var(--magenta);
+  font-size: 15px;
+  margin: 6px 0;
+}
+
+.profile-desc {
+  color: var(--text);
+  font-size: 13px;
+  margin: 8px 0;
+  line-height: 1.5;
+}
+
+.profile-did {
+  color: var(--muted);
+  font-size: 11px;
+  margin-bottom: 14px;
+  word-break: break-all;
+}
+
+/* WORLD / FEED SPLIT (plan §8.2).
+   Lynx web drops @media queries at build, so compact behavior is driven by
+   the `compactViewport` init field + explicit classes, not media queries. */
+.split-layout {
+  display: flex;
+  flex-direction: row;
+  width: 100%;
+  min-height: 100%;
+  padding: 0 16px 24px;
+  box-sizing: border-box;
+}
+
+.split-world {
+  flex: 1;
+  min-width: 0;
+  padding-right: 16px;
+}
+
+.split-feed {
+  width: 420px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  padding-left: 16px;
+}
+
+.split-layout .kicker {
+  margin-bottom: 8px;
+}
+
+/* Compact (mobile) one-pane-at-a-time with WORLD/FEED tabs */
+.split-layout.compact {
+  flex-direction: column;
+  padding: 0 12px 24px;
+}
+
+.split-layout.compact .split-world {
+  padding-right: 0;
+}
+
+.split-layout.compact .split-feed {
+  width: 100%;
+  border-left: none;
+  padding-left: 0;
+}
+
+.split-layout.compact .pane-hidden {
+  display: none;
+}
+
+.pane-tabs {
+  display: flex;
+  flex-direction: row;
+  margin-bottom: 12px;
+  gap: 8px;
+}
+
+.pane-tab {
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 2px;
+  padding: 8px 16px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.pane-tab.active {
+  color: var(--cyan);
+  border-color: var(--cyan);
+}
