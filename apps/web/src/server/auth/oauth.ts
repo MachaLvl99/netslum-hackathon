@@ -117,7 +117,14 @@ export function getOAuthClient(env: CloudflareEnv): Promise<NodeOAuthClient> {
       requestLock: requestLocalLock,
       runtimeImplementation: {
         requestLock: requestLocalLock,
-        createKey: (algs) => WebcryptoKey.generate(algs),
+        createKey: async () => {
+          const keyPair = await crypto.subtle.generateKey(
+            { name: "ECDSA", namedCurve: "P-256" },
+            true,
+            ["sign", "verify"]
+          );
+          return WebcryptoKey.fromKeypair(keyPair, crypto.randomUUID());
+        },
         getRandomValues: (length: number) => crypto.getRandomValues(new Uint8Array(length)),
         digest: async (bytes: Uint8Array, algorithm: { name: string }) => {
           const algName = algorithm.name.replace(/^sha-?/i, "SHA-");
