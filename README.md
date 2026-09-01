@@ -91,16 +91,46 @@ env -u CLOUDFLARE_API_TOKEN nix develop -c pnpm deploy:web
 
 ## Pending (operator actions)
 
-1. **Workers for Platforms ($25/mo)** — purchase in the Cloudflare dashboard;
-   then a token with dispatch-namespace scopes is needed to create
-   `netslum-sites-staging`/`netslum-sites-production` namespaces and flip
-   `SERVERLESS_ENABLED=true`. See the SERVERLESS contingency in the plan.
-2. **Render wildcard TLS** — add `*.pds.netslum.macha.sh` as a custom domain on
-   the PDS service so handle subdomains get certificates (currently worked
-   around with `_atproto` DNS TXT).
+1. **Provisioner token (in progress)** — the W4P plan is purchased and both
+   dispatch namespaces are live (`netslum-sites-staging`,
+   `netslum-sites-production`, outbound → `netslum-site-egress`).
+   `SERVERLESS_ENABLED=true` is deployed, so every publish now provisions a
+   KV namespace + dispatch script via the Cloudflare API; that requires a
+   worker secret `CLOUDFLARE_API_TOKEN` with Workers Scripts Storage:Edit +
+   Workers KV Storage:Edit scopes (the zone-scoped one in env lacks them).
+   Tenant execution itself is already proven: see the runtime boundary
+   proofs below.
+2. **Render wildcard TLS (stuck)** — `*.pds.netslum.macha.sh` is added to the
+   PDS service and all three required DNS records exist and resolve
+   (`*` CNAME → onrender, `_acme-challenge` → `.verify.renderdns.com`,
+   `_cf-custom-hostname` → `.hostname.renderdns.com`, all DNS-only), but
+   Render's verification stays `unverified` after repeated API verify
+   triggers (~15 min). Needs the dashboard's Verify button (it displays the
+   exact records this domain object expects) or Render support. Until then,
+   handle subdomains have no TLS; `macha.pds.netslum.macha.sh` works via the
+   `_atproto` DNS TXT workaround.
 3. **Codex desktop acceptance run** — follow
    [docs/codex-acceptance-checklist.md](docs/codex-acceptance-checklist.md).
 
 Second-account fixtures (invite codes, LOCAL_PDS_REQUIRED boundary for
 external-PDS actors) are also pending — invite codes are issued from
 Tranquil's admin UI.
+
+## Runtime boundary proofs (live, 2026-09-01)
+
+All via the production dispatcher at
+`https://netslum-site-runtime.ryan-a27.workers.dev/site-<id>/api`:
+
+- KV counter fixture: `{"counter":1}` → `{"counter":2}` (persistent KV).
+- Ambient headers stripped (`Cookie`, `Origin`, `X-Forwarded-*` never reach
+  tenant code); an explicit `Authorization: Bearer tenant-test` does.
+- Tenant `Set-Cookie` absent at the client.
+- Egress: `localhost`, `127.0.0.1`, private IPv4, `*.macha.sh`,
+  `*.workers.dev`, and plain `http://` all → `EGRESS_DENIED` 403;
+  `https://example.com` → 200.
+- Oversize request (>1 MiB) → 413.
+- Suspension: `/@macha` and dispatch → 404 while the AT record stays readable.
+- Rate limit: the `SITE_RATE` binding enforces per-machine (verified with a
+  limit-1 probe over one connection); the 100/min site cap is therefore a
+  soft, per-machine cap — inherent to Cloudflare's RateLimit binding, not a
+  netslum bug.
