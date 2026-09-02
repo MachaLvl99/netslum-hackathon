@@ -20,4 +20,5 @@ export interface CloudflareEnv {
   PDS_HOSTNAME?: string;
   PHASE2_PROBE_TOKEN?: string;
   PHASE2_PROBE_COOKIE_KEY?: string;
+  PRIVATE_DATA_KEY?: string;
 }

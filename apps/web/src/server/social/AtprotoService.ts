@@ -187,6 +187,10 @@ export class AtprotoService {
     await this.env.DB.batch([
       this.env.DB.prepare("DELETE FROM post_draft WHERE did=? AND revision=?").bind(actorDid, draftRevision),
       this.env.DB.prepare(
+        "INSERT INTO published_post(draft_revision,uri,cid,published_at,created_at) VALUES(?,?,?,?,?) " +
+        "ON CONFLICT(draft_revision) DO UPDATE SET uri=excluded.uri,cid=excluded.cid,published_at=excluded.published_at"
+      ).bind(draftRevision, uri, cid, publishedAt, Date.now()),
+      this.env.DB.prepare(
         "INSERT INTO optimistic_post(draft_revision,uri,did,cid,post_json,expires_at) VALUES(?,?,?,?,?,?) " +
         "ON CONFLICT(draft_revision) DO UPDATE SET uri=excluded.uri,did=excluded.did,cid=excluded.cid,post_json=excluded.post_json,expires_at=excluded.expires_at"
       ).bind(draftRevision, uri, actorDid, cid, JSON.stringify(optimistic), Date.now() + 15 * 60_000),
@@ -298,15 +302,17 @@ export class AtprotoService {
   async publishPreparedPost(actorDid: string, draftRevision: string): Promise<{ uri: string; cid: string; publishedAt: string }> {
     const agent = await this.getAgent(actorDid);
 
-    // 1. Retry idempotency: a prior publish of this revision is recorded.
+    // 1. Retry idempotency: a prior publish of this revision is recorded in
+    // the durable mapping (PDS-assigned TID rkeys are not reproducible).
     const prior = await this.env.DB.prepare(
-      "SELECT uri,cid FROM optimistic_post WHERE draft_revision=?"
+      "SELECT uri,cid FROM published_post WHERE draft_revision=?"
     ).bind(draftRevision).first<{ uri: string; cid: string }>();
     if (prior) {
+      const rkey = prior.uri.split("/").pop() ?? "";
       const existing = await agent.com.atproto.repo.getRecord({
         repo: actorDid,
         collection: "app.bsky.feed.post",
-        rkey: prior.uri.split("/").pop() ?? ""
+        rkey
       }).catch(() => undefined);
       const record = existing ? postRecordSchema.safeParse(existing.data.value).data : undefined;
       const publishedAt = record?.createdAt ?? new Date().toISOString();
@@ -389,11 +395,15 @@ export class AtprotoService {
     const kind = isLike ? "like" : "repost";
     const collection = `app.bsky.feed.${kind}`;
     const agent = await this.getAgent(actorDid);
-
     // app.bsky.feed.like/repost are lexicon key:"tid" collections, so records
-    // use PDS-assigned TID rkeys. Idempotency is resolved by listing the
-    // actor's records and matching the subject URI.
+    // use PDS-assigned TID rkeys. Idempotency is resolved by the durable
+    // published_reaction mapping; a listRecords scan covers records created
+    // by other clients or before this mapping existed.
     const findExisting = async (): Promise<string | null> => {
+      const mapped = await this.env.DB.prepare(
+        "SELECT uri FROM published_reaction WHERE actor_did=? AND kind=? AND subject_uri=?"
+      ).bind(actorDid, kind, input.uri).first<{ uri: string }>();
+      if (mapped) return mapped.uri.split("/").pop() ?? null;
       const legacyRkey = await deterministicReactionRkey(actorDid, kind, input.uri);
       try {
         const existing = await agent.com.atproto.repo.getRecord({ repo: actorDid, collection, rkey: legacyRkey });
@@ -415,19 +425,133 @@ export class AtprotoService {
       if (input.action === "like" || input.action === "repost") {
         const existingRkey = await findExisting();
         if (existingRkey) return { action: input.action, uri: input.uri, active: true };
-        await agent.com.atproto.repo.createRecord({
+        const created = await agent.com.atproto.repo.createRecord({
           repo: actorDid, collection,
           record: { $type: collection, subject: { uri: input.uri, cid: input.cid }, createdAt: new Date().toISOString() }
         });
+        await this.env.DB.prepare(
+          "INSERT INTO published_reaction(actor_did,kind,subject_uri,uri,cid,created_at) VALUES(?,?,?,?,?,?) " +
+          "ON CONFLICT(actor_did,kind,subject_uri) DO UPDATE SET uri=excluded.uri,cid=excluded.cid"
+        ).bind(actorDid, kind, input.uri, created.data.uri, created.data.cid, Date.now()).run();
         return { action: input.action, uri: input.uri, active: true };
       }
       const existingRkey = await findExisting();
       if (existingRkey) {
         try { await agent.com.atproto.repo.deleteRecord({ repo: actorDid, collection, rkey: existingRkey }); }
         catch { /* delete not found is active:false success */ }
+        await this.env.DB.prepare("DELETE FROM published_reaction WHERE actor_did=? AND kind=? AND subject_uri=?")
+          .bind(actorDid, kind, input.uri).run();
       }
       return { action: input.action, uri: input.uri, active: false };
     }
     return { action: input.action, uri: input.uri, active: false };
+  }
+
+  /** Timeline, thread, notifications, and search reads are proxied through
+   * the Bluesky AppView with the authenticated actor's grant (plan §C3/C5). */
+  private async proxiedAgent(actorDid: string): Promise<Agent> {
+    const agent = await this.getAgent(actorDid);
+    agent.configureProxy("did:web:api.bsky.app#bsky_appview");
+    return agent;
+  }
+
+  private toPostSummary(post: Awaited<ReturnType<Agent["app"]["bsky"]["feed"]["getTimeline"]>>["data"]["feed"][number]["post"]): PostSummary {
+    const record = postRecordSchema.safeParse(post.record).data;
+    const author: PostSummary["author"] = { did: post.author.did, handle: post.author.handle };
+    if (post.author.displayName) author.displayName = post.author.displayName;
+    return {
+      uri: post.uri,
+      cid: post.cid,
+      author,
+      text: record?.text ?? "",
+      createdAt: record?.createdAt ?? new Date().toISOString()
+    };
+  }
+
+  async getTimeline(actorDid: string, cursor?: string, limit = 5): Promise<{ posts: PostSummary[]; cursor?: string }> {
+    const agent = await this.proxiedAgent(actorDid);
+    const response = await agent.app.bsky.feed.getTimeline({ limit, ...(cursor ? { cursor } : {}) }, { signal: AbortSignal.timeout(8000) })
+      .catch(() => {
+        throw new NetslumError("UPSTREAM_UNAVAILABLE", "Timeline unavailable", 503, true);
+      });
+    return {
+      posts: response.data.feed.map((entry) => this.toPostSummary(entry.post)),
+      ...(response.data.cursor ? { cursor: response.data.cursor } : {})
+    };
+  }
+
+  async getPostThread(actorDid: string, uri: string, depth = 6): Promise<{ post: PostSummary; replies: PostSummary[] }> {
+    const agent = await this.proxiedAgent(actorDid);
+    const response = await agent.app.bsky.feed.getPostThread({ uri, depth }, { signal: AbortSignal.timeout(8000) })
+      .catch(() => {
+        throw new NetslumError("NOT_FOUND", "Thread not found", 404);
+      });
+    const thread = response.data.thread;
+    if (!("post" in thread)) throw new NetslumError("NOT_FOUND", "Thread not found", 404);
+    const replies: PostSummary[] = [];
+    const walk = (node: unknown, level: number): void => {
+      if (level <= 0 || !node || typeof node !== "object") return;
+      const entry = node as { post?: unknown; replies?: unknown[] };
+      if (entry.post && typeof entry.post === "object") {
+        const summary = this.toPostSummary(entry.post as never);
+        if (level < depth) replies.push(summary);
+      }
+      for (const child of entry.replies ?? []) walk(child, level - 1);
+    };
+    for (const child of (thread as { replies?: unknown[] }).replies ?? []) walk(child, depth);
+    return { post: this.toPostSummary(thread.post), replies };
+  }
+
+  async deleteOwnPost(actorDid: string, uri: string): Promise<{ deleted: boolean }> {
+    const match = /^at:\/\/([^/]+)\/app\.bsky\.feed\.post\/([^/]+)$/.exec(uri);
+    if (!match || match[1] !== actorDid) throw new NetslumError("FORBIDDEN", "You can only delete your own posts", 403);
+    const agent = await this.getAgent(actorDid);
+    await agent.com.atproto.repo.deleteRecord({ repo: actorDid, collection: "app.bsky.feed.post", rkey: match[2] ?? "" })
+      .catch(() => {
+        throw new NetslumError("NOT_FOUND", "Post not found", 404);
+      });
+    await this.env.DB.prepare("DELETE FROM feed_cache WHERE cache_key LIKE 'town:%'").run();
+    return { deleted: true };
+  }
+
+  async listNotifications(actorDid: string, cursor?: string, limit = 25): Promise<{ notifications: Array<{ uri: string; reason: string; isRead: boolean; indexedAt: string; authorDid: string; authorHandle: string }>; cursor?: string }> {
+    const agent = await this.proxiedAgent(actorDid);
+    const response = await agent.app.bsky.notification.listNotifications({ limit, ...(cursor ? { cursor } : {}) }, { signal: AbortSignal.timeout(8000) })
+      .catch(() => {
+        throw new NetslumError("UPSTREAM_UNAVAILABLE", "Notifications unavailable", 503, true);
+      });
+    return {
+      notifications: response.data.notifications.map((entry) => ({
+        uri: entry.uri,
+        reason: entry.reason,
+        isRead: entry.isRead,
+        indexedAt: entry.indexedAt,
+        authorDid: entry.author.did,
+        authorHandle: entry.author.handle
+      })),
+      ...(response.data.cursor ? { cursor: response.data.cursor } : {})
+    };
+  }
+
+  async markNotificationsSeen(actorDid: string, seenAt?: string): Promise<{ seenAt: string }> {
+    const agent = await this.proxiedAgent(actorDid);
+    const response = await agent.app.bsky.notification.updateSeen({ seenAt: seenAt ?? new Date().toISOString() }, { signal: AbortSignal.timeout(8000) })
+      .catch(() => {
+        throw new NetslumError("UPSTREAM_UNAVAILABLE", "Mark seen failed", 502);
+      });
+    void response;
+    return { seenAt: seenAt ?? new Date().toISOString() };
+  }
+
+  async searchPosts(actorDid: string | undefined, query: string, cursor?: string, limit = 25): Promise<{ posts: PostSummary[]; cursor?: string }> {
+    const agent = actorDid ? await this.proxiedAgent(actorDid) : await this.getAgent();
+    const response = await agent.app.bsky.feed.searchPosts({ q: query, limit, ...(cursor ? { cursor } : {}) }, { signal: AbortSignal.timeout(8000) })
+      .catch(() => {
+        throw new NetslumError("UPSTREAM_UNAVAILABLE", "Search unavailable", 503, true);
+      });
+    return {
+      posts: response.data.posts.map((post) => this.toPostSummary(post)),
+      ...(response.data.cursor ? { cursor: response.data.cursor } : {})
+    };
   }
 }

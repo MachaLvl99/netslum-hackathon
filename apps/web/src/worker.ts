@@ -14,16 +14,22 @@ import {
   slugSchema,
   presentHandle,
   homeModeSchema,
+  prepareImageSchema,
+  prepareVideoSchema,
   zoneMutationSchema
 } from "@netslum/contracts";
 import { OAUTH_SCOPE_VERSION, VIDEO_SERVICE_AUDIENCE } from "./server/auth/permissions.js";
-import { z } from "zod";
+import { z, ZodError } from "zod";
 import { rewriteSiteHtml } from "@netslum/sandbox";
 import type { CloudflareEnv } from "./types.js";
 import { getOAuthClient, getPhase2ProbeOAuthClient } from "./server/auth/oauth.js";
-import { HomeSettingsService } from "./server/home/HomeSettingsService.js";
+import { MediaService } from "./server/media/MediaService.js";
+import { GraphService } from "./server/social/GraphService.js";
+import { ChatService } from "./server/social/ChatService.js";
+import { DmDraftService } from "./server/social/DmDraftService.js";
 import { authenticateRequest, canPublishSite, issueWebSession, logout, sessionCapabilities } from "./server/auth/session.js";
 import { AtprotoService } from "./server/social/AtprotoService.js";
+import { HomeSettingsService } from "./server/home/HomeSettingsService.js";
 import { authenticateProbeRequest, issueProbeSession, logoutProbe, probeGated, requireProbeCsrf } from "./server/auth/probeSession.js";
 import { SiteService } from "./server/sites/SiteService.js";
 import { probeAppviewCapabilities } from "./server/auth/capabilityProbe.js";
@@ -45,6 +51,9 @@ app.use("*", async (c, next) => {
 
 // Error handling middleware
 app.onError((err, c) => {
+  if (err instanceof ZodError) {
+    return c.json({ code: "INVALID_INPUT", message: "Request validation failed", retryable: false }, 400);
+  }
   if (err instanceof NetslumError) {
     const status = (err.status >= 400 && err.status <= 599 ? err.status : 500) as 500;
     return c.json({ code: err.code, message: err.message, retryable: err.retryable, data: err.data }, status);
@@ -358,6 +367,236 @@ app.post("/api/reactions", async (c) => {
   const service = new AtprotoService(c.env);
   const result = await service.reactToPost(auth.did, input);
   return c.json(result);
+});
+
+// Graph mutations (plan §C2): follow/block/mute with viewer state.
+app.post("/api/graph/resolve", async (c) => {
+  await authenticateRequest(c.req.raw, c.env, false);
+  const input = z.object({ actor: z.string().max(315) }).strict().parse(await c.req.json());
+  const service = new GraphService(c.env);
+  return c.json(await service.resolveActor(input.actor));
+});
+
+app.post("/api/graph/follow", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({ actor: z.string().max(315), follow: z.boolean() }).strict().parse(await c.req.json());
+  const service = new GraphService(c.env);
+  const target = await service.resolveActor(input.actor);
+  const result = await service.setFollowState(auth.did, target.did, input.follow);
+  return c.json(result);
+});
+
+app.post("/api/graph/block", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({ actor: z.string().max(315), block: z.boolean() }).strict().parse(await c.req.json());
+  const service = new GraphService(c.env);
+  const target = await service.resolveActor(input.actor);
+  const result = await service.setBlockState(auth.did, target.did, input.block);
+  return c.json(result);
+});
+
+app.post("/api/graph/mute", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({ actor: z.string().max(315), mute: z.boolean() }).strict().parse(await c.req.json());
+  const service = new GraphService(c.env);
+  const target = await service.resolveActor(input.actor);
+  const result = await service.setMuteState(auth.did, target.did, input.mute);
+  return c.json(result);
+});
+
+app.post("/api/moderation/report", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({
+    subjectUri: z.string().max(2048),
+    subjectCid: z.string().max(200).optional(),
+    reasonType: z.string().max(100).regex(/^com\.atproto\.moderation\./),
+    comment: z.string().max(2000).optional()
+  }).strict().parse(await c.req.json());
+  const service = new GraphService(c.env);
+  return c.json(await service.reportContent(auth.did, {
+    subjectUri: input.subjectUri,
+    reasonType: input.reasonType,
+    ...(input.subjectCid !== undefined ? { subjectCid: input.subjectCid } : {}),
+    ...(input.comment !== undefined ? { comment: input.comment } : {})
+  }));
+});
+
+// Social reads (plan §C3/C5): timeline, threads, notifications, search.
+app.get("/api/timeline", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const limit = z.coerce.number().int().min(1).max(50).default(25).parse(c.req.query("limit") ?? undefined);
+  const service = new AtprotoService(c.env);
+  const result = await service.getTimeline(auth.did, c.req.query("cursor") ?? undefined, limit);
+  return c.json(result, 200, { "Cache-Control": "no-store" });
+});
+
+app.get("/api/post-thread", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const uri = z.string().max(2048).parse(c.req.query("uri"));
+  const service = new AtprotoService(c.env);
+  return c.json(await service.getPostThread(auth.did, uri), 200, { "Cache-Control": "no-store" });
+});
+
+// Media pipeline (plan §C4): prepared drafts with encrypted metadata.
+app.post("/api/media/image/prepare", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = prepareImageSchema.parse(await c.req.json());
+  const service = new MediaService(c.env);
+  return c.json(await service.prepareImage(auth.did, input));
+});
+
+app.post("/api/media/image/:draftId", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const draftId = z.string().max(64).parse(c.req.param("draftId"));
+  const bytes = new Uint8Array(await c.req.arrayBuffer());
+  const service = new MediaService(c.env);
+  return c.json(await service.uploadImage(auth.did, draftId, bytes));
+});
+
+app.post("/api/media/video/prepare", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = prepareVideoSchema.parse(await c.req.json());
+  const service = new MediaService(c.env);
+  return c.json(await service.prepareVideo(auth.did, input));
+});
+
+// Direct messages (plan §D). All reads/writes proxy to Bluesky Chat with the
+// actor's grant; no message bodies are stored beyond encrypted pending sends.
+app.get("/api/dms/status", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const service = new ChatService(c.env);
+  return c.json(await service.getStatus(auth.did), 200, { "Cache-Control": "no-store" });
+});
+
+app.get("/api/dms/conversations", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const limit = z.coerce.number().int().min(1).max(50).default(25).parse(c.req.query("limit") ?? undefined);
+  const service = new ChatService(c.env);
+  return c.json(await service.listConversations(auth.did, c.req.query("cursor") ?? undefined, limit), 200, { "Cache-Control": "no-store" });
+});
+
+app.get("/api/dms/requests", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const limit = z.coerce.number().int().min(1).max(50).default(25).parse(c.req.query("limit") ?? undefined);
+  const service = new ChatService(c.env);
+  return c.json(await service.listRequests(auth.did, c.req.query("cursor") ?? undefined, limit), 200, { "Cache-Control": "no-store" });
+});
+
+app.get("/api/dms/conversation", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const members = z.array(z.string().max(315)).min(1).max(2).parse((c.req.query("members") ?? "").split(",").filter(Boolean));
+  const service = new ChatService(c.env);
+  return c.json(await service.getConvoForMembers(auth.did, members), 200, { "Cache-Control": "no-store" });
+});
+
+app.get("/api/dms/messages", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const convoId = z.string().max(64).parse(c.req.query("convoId"));
+  const limit = z.coerce.number().int().min(1).max(50).default(50).parse(c.req.query("limit") ?? undefined);
+  const service = new ChatService(c.env);
+  return c.json(await service.getMessages(auth.did, convoId, c.req.query("cursor") ?? undefined, limit), 200, { "Cache-Control": "no-store" });
+});
+
+app.post("/api/dms/prepare", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({
+    convoId: z.string().max(64),
+    recipientDids: z.array(z.string().max(315)).min(1).max(8),
+    text: z.string().max(4000)
+  }).strict().parse(await c.req.json());
+  const service = new DmDraftService(c.env);
+  return c.json(await service.prepare(auth.did, input), 200, { "Cache-Control": "no-store" });
+});
+
+app.post("/api/dms/send", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({ revision: z.string().max(64) }).strict().parse(await c.req.json());
+  const drafts = new DmDraftService(c.env);
+  const chat = new ChatService(c.env);
+  const prepared = await drafts.load(auth.did, input.revision);
+  const sent = await chat.sendMessage(auth.did, prepared.convoId, prepared.text);
+  await drafts.consume(auth.did, input.revision);
+  return c.json({ messageId: sent.messageId });
+});
+
+app.post("/api/dms/read", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({ convoId: z.string().max(64), messageId: z.string().max(64).optional() }).strict().parse(await c.req.json());
+  const service = new ChatService(c.env);
+  return c.json(await service.updateRead(auth.did, input.convoId, input.messageId));
+});
+
+app.post("/api/dms/react", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({
+    convoId: z.string().max(64),
+    messageId: z.string().max(64),
+    value: z.string().max(8),
+    remove: z.boolean().optional()
+  }).strict().parse(await c.req.json());
+  const service = new ChatService(c.env);
+  return c.json(await service.react(auth.did, input.convoId, input.messageId, input.value, input.remove === true));
+});
+
+app.post("/api/dms/delete-for-self", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({ convoId: z.string().max(64), messageId: z.string().max(64) }).strict().parse(await c.req.json());
+  const service = new ChatService(c.env);
+  return c.json(await service.deleteMessageForSelf(auth.did, input.convoId, input.messageId));
+});
+
+app.post("/api/dms/accept", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({ convoId: z.string().max(64) }).strict().parse(await c.req.json());
+  const service = new ChatService(c.env);
+  return c.json(await service.acceptConvo(auth.did, input.convoId));
+});
+
+app.post("/api/dms/mute", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({ convoId: z.string().max(64), mute: z.boolean() }).strict().parse(await c.req.json());
+  const service = new ChatService(c.env);
+  return c.json(await service.setMuteState(auth.did, input.convoId, input.mute));
+});
+
+// DM agent toggle (plan §B5): a visible trusted toggle is the only way.
+app.put("/api/settings/dm-agent", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({ enabled: z.boolean() }).strict().parse(await c.req.json());
+  await c.env.DB.prepare("UPDATE web_session SET dm_agent_enabled=? WHERE id_hash IN (SELECT id_hash FROM web_session WHERE did=?)")
+    .bind(input.enabled ? 1 : 0, auth.did).run();
+  return c.json({ dmAgentEnabled: input.enabled });
+});
+
+app.delete("/api/posts/:uri", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const uri = decodeURIComponent(c.req.param("uri"));
+  const service = new AtprotoService(c.env);
+  return c.json(await service.deleteOwnPost(auth.did, uri));
+});
+
+app.get("/api/notifications", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const limit = z.coerce.number().int().min(1).max(50).default(25).parse(c.req.query("limit") ?? undefined);
+  const service = new AtprotoService(c.env);
+  const result = await service.listNotifications(auth.did, c.req.query("cursor") ?? undefined, limit);
+  return c.json(result, 200, { "Cache-Control": "no-store" });
+});
+
+app.post("/api/notifications/seen", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({ seenAt: z.string().max(40).optional() }).strict().parse(await c.req.json().catch(() => ({})));
+  const service = new AtprotoService(c.env);
+  return c.json(await service.markNotificationsSeen(auth.did, input.seenAt));
+});
+
+app.get("/api/search/posts", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false).catch(() => null);
+  const q = z.string().min(1).max(64).parse(c.req.query("q"));
+  const limit = z.coerce.number().int().min(1).max(25).default(25).parse(c.req.query("limit") ?? undefined);
+  const service = new AtprotoService(c.env);
+  const result = await service.searchPosts(auth?.did, q, c.req.query("cursor") ?? undefined, limit);
+  return c.json(result, 200, { "Cache-Control": "no-store" });
 });
 
 
