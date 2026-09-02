@@ -296,34 +296,41 @@ export class AtprotoService {
   }
 
   async publishPreparedPost(actorDid: string, draftRevision: string): Promise<{ uri: string; cid: string; publishedAt: string }> {
-    const rkey = deterministicPostRkey(draftRevision);
     const agent = await this.getAgent(actorDid);
+
+    // 1. Retry idempotency: a prior publish of this revision is recorded.
+    const prior = await this.env.DB.prepare(
+      "SELECT uri,cid FROM optimistic_post WHERE draft_revision=?"
+    ).bind(draftRevision).first<{ uri: string; cid: string }>();
+    if (prior) {
+      const existing = await agent.com.atproto.repo.getRecord({
+        repo: actorDid,
+        collection: "app.bsky.feed.post",
+        rkey: prior.uri.split("/").pop() ?? ""
+      }).catch(() => undefined);
+      const record = existing ? postRecordSchema.safeParse(existing.data.value).data : undefined;
+      const publishedAt = record?.createdAt ?? new Date().toISOString();
+      await this.finalizePublishedPost(actorDid, draftRevision, prior.uri, prior.cid, record?.text ?? "", publishedAt);
+      return { uri: prior.uri, cid: prior.cid, publishedAt };
+    }
+
+    // 2. Legacy: the first deployments used deterministic netslum-<hex>
+    // rkeys; Tranquil accepted them. Resolve those records so old drafts
+    // still publish idempotently.
+    const legacyRkey = deterministicPostRkey(draftRevision);
     try {
       const existing = await agent.com.atproto.repo.getRecord({
         repo: actorDid,
         collection: "app.bsky.feed.post",
-        rkey
+        rkey: legacyRkey
       });
       const record = postRecordSchema.safeParse(existing.data.value).data;
       const publishedAt = record?.createdAt ?? new Date().toISOString();
       const cid = existing.data.cid ?? "";
-      await this.finalizePublishedPost(
-        actorDid,
-        draftRevision,
-        existing.data.uri,
-        cid,
-        record?.text ?? "",
-        publishedAt
-      );
+      await this.finalizePublishedPost(actorDid, draftRevision, existing.data.uri, cid, record?.text ?? "", publishedAt);
       return { uri: existing.data.uri, cid, publishedAt };
-    } catch (error) {
-      if (!(error instanceof Error) || !error.message.includes("Could not find record")) {
-        const draftStillExists = await this.env.DB.prepare(
-          "SELECT 1 AS present FROM post_draft WHERE did=? AND revision=?"
-        ).bind(actorDid, draftRevision).first<{ present: number }>();
-        if (!draftStillExists) throw error;
-      }
-    }
+    } catch { /* not previously published under the legacy key */ }
+
 
     const draft = await this.env.DB.prepare(
       "SELECT text,reply_to_uri FROM post_draft WHERE did=? AND revision=?"
@@ -357,7 +364,6 @@ export class AtprotoService {
     const created = await agent.com.atproto.repo.createRecord({
       repo: actorDid,
       collection: "app.bsky.feed.post",
-      rkey,
       record: {
         $type: "app.bsky.feed.post",
         text: richText.text,
@@ -380,23 +386,48 @@ export class AtprotoService {
 
   async reactToPost(actorDid: string, input: { uri: string; cid: string; action: "like" | "unlike" | "repost" | "unrepost" }): Promise<{ action: string; uri: string; active: boolean }> {
     const isLike = input.action === "like" || input.action === "unlike";
-    const collection = isLike ? "app.bsky.feed.like" : "app.bsky.feed.repost";
-    const rkey = await deterministicReactionRkey(actorDid, input.action, input.uri);
+    const kind = isLike ? "like" : "repost";
+    const collection = `app.bsky.feed.${kind}`;
     const agent = await this.getAgent(actorDid);
-    if (input.action === "like" || input.action === "repost") {
+
+    // app.bsky.feed.like/repost are lexicon key:"tid" collections, so records
+    // use PDS-assigned TID rkeys. Idempotency is resolved by listing the
+    // actor's records and matching the subject URI.
+    const findExisting = async (): Promise<string | null> => {
+      const legacyRkey = await deterministicReactionRkey(actorDid, kind, input.uri);
       try {
-        const existing = await agent.com.atproto.repo.getRecord({ repo: actorDid, collection, rkey });
-        const subject = subjectRecordSchema.safeParse(existing.data.value).data?.subject?.uri;
-        if (subject === input.uri) return { action: input.action, uri: input.uri, active: true };
-      } catch { /* create */ }
-      await agent.com.atproto.repo.createRecord({
-        repo: actorDid, collection, rkey,
-        record: { $type: collection, subject: { uri: input.uri, cid: input.cid }, createdAt: new Date().toISOString() }
+        const existing = await agent.com.atproto.repo.getRecord({ repo: actorDid, collection, rkey: legacyRkey });
+        if (subjectRecordSchema.safeParse(existing.data.value).data?.subject?.uri === input.uri) return legacyRkey;
+      } catch { /* legacy key not used */ }
+      const list = await agent.com.atproto.repo.listRecords({
+        repo: actorDid,
+        collection,
+        limit: 100
       });
-      return { action: input.action, uri: input.uri, active: true };
+      for (const rec of list.data.records) {
+        const parsed = subjectRecordSchema.safeParse(rec.value).data;
+        if (parsed?.subject?.uri === input.uri) return rec.uri.split("/").pop() ?? null;
+      }
+      return null;
+    };
+
+    if (kind === "like" || kind === "repost") {
+      if (input.action === "like" || input.action === "repost") {
+        const existingRkey = await findExisting();
+        if (existingRkey) return { action: input.action, uri: input.uri, active: true };
+        await agent.com.atproto.repo.createRecord({
+          repo: actorDid, collection,
+          record: { $type: collection, subject: { uri: input.uri, cid: input.cid }, createdAt: new Date().toISOString() }
+        });
+        return { action: input.action, uri: input.uri, active: true };
+      }
+      const existingRkey = await findExisting();
+      if (existingRkey) {
+        try { await agent.com.atproto.repo.deleteRecord({ repo: actorDid, collection, rkey: existingRkey }); }
+        catch { /* delete not found is active:false success */ }
+      }
+      return { action: input.action, uri: input.uri, active: false };
     }
-    try { await agent.com.atproto.repo.deleteRecord({ repo: actorDid, collection, rkey }); }
-    catch { /* delete not found is active:false success */ }
     return { action: input.action, uri: input.uri, active: false };
   }
 }
