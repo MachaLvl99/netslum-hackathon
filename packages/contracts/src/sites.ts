@@ -24,7 +24,7 @@ export const saveSiteFileSchema = z.object({
   expectedRevision: revisionSchema
 }).strict();
 export const deleteSiteFileSchema = z.object({ path: sitePathSchema, expectedRevision: revisionSchema }).strict();
-export const readSiteFileSchema = z.object({ path: sitePathSchema, offset: z.number().int().nonnegative().default(0), maxChars: z.number().int().min(1).max(1000).default(1000) }).strict();
+export const readSiteFileSchema = z.object({ path: sitePathSchema, offset: z.coerce.number().int().nonnegative().default(0), maxChars: z.coerce.number().int().min(1).max(1000).default(1000) }).strict();
 export const publishSiteSchema = z.object({ revision: revisionSchema }).strict();
 export type SiteFile = z.infer<typeof siteFileSchema>;
 
