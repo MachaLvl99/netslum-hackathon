@@ -49,9 +49,10 @@ export default {
       if (url.pathname === `/_netslum/${HTMX_SCRIPT}`) {
         const pinned = await env.SITE_FILES.get(`_netslum/${HTMX_SCRIPT}`);
         if (!pinned) return new Response("pinned htmx missing", { status: 503 });
-        const digest = await sha256Hex(new Uint8Array(await pinned.arrayBuffer()));
+        const pinnedBytes = new Uint8Array(await pinned.arrayBuffer());
+        const digest = await sha256Hex(pinnedBytes);
         if (digest !== HTMX_SHA256) return new Response("htmx hash mismatch", { status: 503 });
-        return new Response(request.method === "HEAD" ? null : pinned.body, {
+        return new Response(request.method === "HEAD" ? null : pinnedBytes, {
           headers: {
             "Content-Type": "text/javascript; charset=utf-8",
             "Cache-Control": "public,max-age=31536000,immutable",
