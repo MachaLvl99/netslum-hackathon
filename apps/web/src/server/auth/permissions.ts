@@ -1,6 +1,10 @@
 const APPVIEW_AUDIENCE = "did:web:api.bsky.app#bsky_appview";
 const CHAT_AUDIENCE = "did:web:api.bsky.chat#bsky_chat";
-
+// Proven live (A4): the Bluesky video service requires service-auth tokens
+// minted by the account's PDS with the audience did:web:video.bsky.app —
+// the video service DID itself, not the account's PDS DID. The wildcard
+// uploadBlob scope below permits minting that token for this audience.
+export const VIDEO_SERVICE_AUDIENCE = "did:web:video.bsky.app";
 export const OAUTH_SCOPE_VERSION = 2;
 export const LEGACY_OAUTH_SCOPE = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete repo:sh.macha.netslumSite?action=create&action=update&action=delete blob:*/*";
 
@@ -81,18 +85,27 @@ function rpcScope(method: string, audience: string): string {
   return `rpc:${method}?aud=${encodeURIComponent(audience)}`;
 }
 
+export const VIDEO_METHODS = [
+  "app.bsky.video.abortUpload",
+  "app.bsky.video.findVideoRepo",
+  "app.bsky.video.getJobStatus",
+  "app.bsky.video.getUploadLimits",
+  "app.bsky.video.startUpload",
+  "app.bsky.video.uploadPart"
+] as const;
+
 export const PHASE2_OAUTH_SCOPE = [
   "atproto",
   ...repositoryScopes,
   "blob:*/*",
-  // The video service uses a service-auth token whose audience is the
-  // account's PDS DID. The PDS varies by actor, so the audience must be
-  // wildcarded while the permitted method remains exact.
+  // Blob uploads go through the account's PDS; the uploadBlob service-auth
+  // token is minted for downstream services (e.g. the video service).
   rpcScope("com.atproto.repo.uploadBlob", "*"),
   // Reports may target the user's selected labeler, not necessarily Bluesky's
   // AppView, so only the endpoint is fixed.
   rpcScope("com.atproto.moderation.createReport", "*"),
   ...APPVIEW_METHODS.map((method) => rpcScope(method, APPVIEW_AUDIENCE)),
+  ...VIDEO_METHODS.map((method) => rpcScope(method, VIDEO_SERVICE_AUDIENCE)),
   ...CHAT_METHODS.map((method) => rpcScope(method, CHAT_AUDIENCE))
 ].join(" ");
 

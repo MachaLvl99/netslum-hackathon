@@ -22,7 +22,10 @@ import { authenticateRequest, canPublishSite, issueWebSession, logout } from "./
 import { AtprotoService } from "./server/social/AtprotoService.js";
 import { authenticateProbeRequest, issueProbeSession, logoutProbe, probeGated, requireProbeCsrf } from "./server/auth/probeSession.js";
 import { SiteService } from "./server/sites/SiteService.js";
-import { probeAppviewCapabilities, probeVideoCapabilities } from "./server/auth/capabilityProbe.js";
+import { probeAppviewCapabilities } from "./server/auth/capabilityProbe.js";
+import { probeVideoPublish, probeVideoStart } from "./server/auth/videoSpike.js";
+import { probeDmBlockBehavior, probeDmLifecycle, probeDmNoneDenial } from "./server/auth/dmSpike.js";
+import { VIDEO_SERVICE_AUDIENCE } from "./server/auth/permissions.js";
 import { ZoneRoom } from "./server/zones/ZoneRoom.js";
 import { Agent } from "@atproto/api";
 
@@ -157,9 +160,42 @@ app.get("/api/__phase2/probe/capabilities", async (c) => {
   return c.json({ did: auth.did, scope: token.scope, results }, 200, { "Cache-Control": "no-store" });
 });
 
-app.post("/api/__phase2/probe/video", async (c) => {
+app.post("/api/__phase2/probe/dm", async (c) => {
   const auth = await authenticateProbeRequest(c.req.raw, c.env);
   requireProbeCsrf(c.req.raw, c.env);
+  const phase = c.req.query("phase");
+  const senderDid = c.req.query("sender");
+  const recipientDid = c.req.query("recipient");
+  if (!phase || !["accepted", "none", "block"].includes(phase)) {
+    throw new NetslumError("INVALID_INPUT", "phase query parameter (accepted|none|block) is required", 400);
+  }
+  if (!senderDid?.startsWith("did:") || !recipientDid?.startsWith("did:")) {
+    throw new NetslumError("INVALID_INPUT", "sender and recipient DID query parameters are required", 400);
+  }
+  if (auth.did !== senderDid && auth.did !== recipientDid) {
+    throw new NetslumError("INVALID_INPUT", "the driving web session must be one of sender or recipient", 400);
+  }
+  const client = await getPhase2ProbeOAuthClient(c.env);
+  const senderSession = await client.restore(senderDid);
+  const recipientSession = await client.restore(recipientDid);
+  let steps: Awaited<ReturnType<typeof probeDmLifecycle>>;
+  if (phase === "accepted") {
+    steps = await probeDmLifecycle(senderSession, recipientSession, senderDid, recipientDid);
+  } else if (phase === "none") {
+    steps = await probeDmNoneDenial(senderSession, recipientSession, senderDid, recipientDid);
+  } else {
+    steps = await probeDmBlockBehavior(senderSession, recipientSession, senderDid, recipientDid);
+  }
+  return c.json({ did: auth.did, sender: senderDid, recipient: recipientDid, steps }, 200, { "Cache-Control": "no-store" });
+});
+
+app.post("/api/__phase2/probe/video/start", async (c) => {
+  const auth = await authenticateProbeRequest(c.req.raw, c.env);
+  requireProbeCsrf(c.req.raw, c.env);
+  const sizeBytes = Number(c.req.query("sizeBytes"));
+  if (!Number.isInteger(sizeBytes) || sizeBytes < 1 || sizeBytes > 100 * 1024 * 1024) {
+    throw new NetslumError("INVALID_INPUT", "sizeBytes query parameter is required", 400);
+  }
   const client = await getPhase2ProbeOAuthClient(c.env);
   const oauthSession = await client.restore(auth.did);
   const agent = new Agent(oauthSession as never);
@@ -167,8 +203,43 @@ app.post("/api/__phase2/probe/video", async (c) => {
     const response = await agent.com.atproto.server.getServiceAuth({ aud, lxm, exp: Math.floor(Date.now() / 1000) + 1800 });
     return response.data.token;
   };
-  const video = await probeVideoCapabilities(oauthSession, getSessionServiceAuth);
-  return c.json({ did: auth.did, video }, 200, { "Cache-Control": "no-store" });
+  // Empirical: getUploadLimits wants aud=video service + its own lxm, while
+  // startUpload wants aud=the actor's PDS + uploadBlob lxm. Resolve the PDS
+  // DID for the second token.
+  const didDocUrl = auth.did.startsWith("did:plc:")
+    ? `https://plc.directory/${encodeURIComponent(auth.did)}`
+    : `https://${auth.did.slice(8).split(":")[0]}/.well-known/did.json`;
+  const didDocResponse = await fetch(didDocUrl, { signal: AbortSignal.timeout(10_000) });
+  if (!didDocResponse.ok) {
+    throw new NetslumError("UPSTREAM_UNAVAILABLE", `DID document request failed (${didDocResponse.status})`, 502);
+  }
+  const didDocParsed = z.object({ service: z.array(z.record(z.string(), z.unknown())).optional() }).safeParse(await didDocResponse.json());
+  if (!didDocParsed.success) {
+    throw new NetslumError("UPSTREAM_UNAVAILABLE", "DID document is not valid JSON with a service array", 502);
+  }
+  const pdsService = didDocParsed.data.service?.find((s) => typeof s === "object" && s !== null && typeof (s as { id?: unknown }).id === "string" && ((s as { id?: unknown }).id as string).endsWith("#atproto_pds")) as { serviceEndpoint?: unknown } | undefined;
+  const pdsEndpoint = typeof pdsService?.serviceEndpoint === "string" ? pdsService.serviceEndpoint : null;
+  if (!pdsEndpoint) throw new NetslumError("UPSTREAM_UNAVAILABLE", "PDS endpoint not found in DID document", 502);
+  const pdsDid = `did:web:${new URL(pdsEndpoint).hostname}`;
+  const start = await probeVideoStart(oauthSession, getSessionServiceAuth, VIDEO_SERVICE_AUDIENCE, pdsDid, sizeBytes);
+  return c.json({ did: auth.did, serviceAudience: VIDEO_SERVICE_AUDIENCE, pdsDid, ...start }, 200, { "Cache-Control": "no-store" });
+});
+
+app.post("/api/__phase2/probe/video/publish", async (c) => {
+  const auth = await authenticateProbeRequest(c.req.raw, c.env);
+  requireProbeCsrf(c.req.raw, c.env);
+  const blobRef = await c.req.json<Record<string, unknown>>().catch(() => null);
+  if (!blobRef || typeof blobRef.$type !== "string" || blobRef.$type !== "blob") {
+    throw new NetslumError("INVALID_INPUT", "a completed blob ref is required", 400);
+  }
+  const blobLink = (blobRef.ref as { $link?: unknown } | undefined)?.$link;
+  if (typeof blobLink !== "string" || blobLink.length === 0) {
+    throw new NetslumError("INVALID_INPUT", "blob ref must contain a nonempty $link", 400);
+  }
+  const client = await getPhase2ProbeOAuthClient(c.env);
+  const oauthSession = await client.restore(auth.did);
+  const steps = await probeVideoPublish(c.env, oauthSession, auth.did, blobRef);
+  return c.json({ did: auth.did, steps }, 200, { "Cache-Control": "no-store" });
 });
 
 app.post("/api/__phase2/probe/logout", async (c) => {
