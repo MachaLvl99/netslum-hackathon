@@ -18,11 +18,27 @@ function cookies(request: Request): Record<string, string> {
 
 export interface AuthenticatedSession { did: string; csrfToken: string; }
 
-export async function issueWebSession(env: CloudflareEnv, did: string): Promise<{ headers: Headers; csrfToken: string }> {
+export interface IssuedWebSession { headers: Headers; csrfToken: string; }
+
+export async function issueWebSession(
+  env: CloudflareEnv,
+  did: string,
+  capabilities?: { grantedScope: string; scopeVersion: number }
+): Promise<IssuedWebSession> {
   const sessionToken = await randomToken();
   const csrfToken = await randomToken();
   const now = Date.now();
-  await env.DB.prepare("INSERT INTO web_session(id_hash,did,csrf_hash,created_at,expires_at) VALUES(?,?,?,?,?)").bind(await hashToken(sessionToken), did, await hashToken(csrfToken), now, now + MAX_AGE_SECONDS * 1000).run();
+  await env.DB.prepare(
+    "INSERT INTO web_session(id_hash,did,csrf_hash,created_at,expires_at,granted_scope,scope_version,dm_agent_enabled) VALUES(?,?,?,?,?,?,?,0)"
+  ).bind(
+    await hashToken(sessionToken),
+    did,
+    await hashToken(csrfToken),
+    now,
+    now + MAX_AGE_SECONDS * 1000,
+    capabilities?.grantedScope ?? null,
+    capabilities?.scopeVersion ?? 1
+  ).run();
   const headers = new Headers();
   headers.append("Set-Cookie", `${SESSION_COOKIE}=${sessionToken}; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=${MAX_AGE_SECONDS}`);
   headers.append("Set-Cookie", `${CSRF_COOKIE}=${csrfToken}; Secure; SameSite=Strict; Path=/; Max-Age=${MAX_AGE_SECONDS}`);

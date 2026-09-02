@@ -17,10 +17,12 @@ import {
 import { z } from "zod";
 import { rewriteSiteHtml } from "@netslum/sandbox";
 import type { CloudflareEnv } from "./types.js";
-import { getOAuthClient } from "./server/auth/oauth.js";
+import { getOAuthClient, getPhase2ProbeOAuthClient } from "./server/auth/oauth.js";
 import { authenticateRequest, canPublishSite, issueWebSession, logout } from "./server/auth/session.js";
 import { AtprotoService } from "./server/social/AtprotoService.js";
+import { authenticateProbeRequest, issueProbeSession, logoutProbe, probeGated } from "./server/auth/probeSession.js";
 import { SiteService } from "./server/sites/SiteService.js";
+import { probeAppviewCapabilities } from "./server/auth/capabilityProbe.js";
 import { ZoneRoom } from "./server/zones/ZoneRoom.js";
 
 const app = new Hono<{ Bindings: CloudflareEnv }>();
@@ -74,6 +76,11 @@ app.get("/oauth-client-metadata.json", async (c) => {
   }
 });
 
+app.get("/oauth-v2-probe-client-metadata.json", async (c) => {
+  const client = await getPhase2ProbeOAuthClient(c.env);
+  return c.json(client.clientMetadata);
+});
+
 app.get("/.well-known/jwks.json", async (c) => {
   try {
     const client = await getOAuthClient(c.env);
@@ -105,12 +112,69 @@ app.get("/oauth/login", async (c) => {
   return c.redirect(url.toString(), 302);
 });
 
+// Temporary Phase 2 capability client, operator-gated by a Bearer launch
+// token and a separate cookie/session namespace. Production login keeps the
+// proven Phase 1 scope until this exact grant succeeds on both Tranquil and
+// Bluesky; these routes are removed before Phase 2 ships.
+app.get("/oauth/v2-probe/login", async (c) => {
+  await probeGated(c.env, c.req.raw);
+  let target = (c.req.query("handle") ?? "").trim().replace(/^@/, "");
+  if (!target) throw new NetslumError("INVALID_INPUT", "A probe handle is required", 400);
+  if (!target.startsWith("did:") && !target.startsWith("http://") && !target.startsWith("https://") && !target.includes(".")) {
+    target = `${target}.${c.env.PDS_HOSTNAME ?? "pds.netslum.macha.sh"}`;
+  }
+  const client = await getPhase2ProbeOAuthClient(c.env);
+  const url = await client.authorize(target, { state: crypto.randomUUID() });
+  return c.redirect(url.toString(), 302);
+});
+
+app.get("/oauth/v2-probe/callback", async (c) => {
+  const client = await getPhase2ProbeOAuthClient(c.env);
+  const params = new URLSearchParams(new URL(c.req.url).search);
+  const redirectUri = `${c.env.PUBLIC_URL.replace(/\/$/, "")}/oauth/v2-probe/callback`;
+  const { session } = await client.callback(params, { redirect_uri: redirectUri as `https://${string}` });
+  await session.getTokenInfo(false);
+  const headers = await issueProbeSession(c.env, session.did);
+  headers.set("Location", "/api/__phase2/probe/session");
+  return new Response(null, { status: 302, headers });
+});
+
+app.get("/api/__phase2/probe/session", async (c) => {
+  const auth = await authenticateProbeRequest(c.req.raw, c.env);
+  const client = await getPhase2ProbeOAuthClient(c.env);
+  const session = await client.restore(auth.did);
+  const token = await session.getTokenInfo(false);
+  return c.json({ did: auth.did, scope: token.scope, expiresAt: token.expiresAt?.toISOString() ?? null });
+});
+
+app.get("/api/__phase2/probe/capabilities", async (c) => {
+  const auth = await authenticateProbeRequest(c.req.raw, c.env);
+  const client = await getPhase2ProbeOAuthClient(c.env);
+  const oauthSession = await client.restore(auth.did);
+  const token = await oauthSession.getTokenInfo(false);
+  const results = await probeAppviewCapabilities(oauthSession);
+  return c.json({ did: auth.did, scope: token.scope, results });
+});
+
+app.post("/api/__phase2/probe/logout", async (c) => {
+  const auth = await authenticateProbeRequest(c.req.raw, c.env);
+  const client = await getPhase2ProbeOAuthClient(c.env);
+  await client.revoke(auth.did).catch(() => undefined);
+  await c.env.DB.prepare("DELETE FROM oauth_probe_session WHERE did=?").bind(auth.did).run();
+  const headers = await logoutProbe(c.req.raw, c.env);
+  return c.json({ ok: true }, 200, { "Set-Cookie": headers.getSetCookie()[0] ?? "" });
+});
+
 // OAuth Callback
 app.get("/oauth/callback", async (c) => {
   const client = await getOAuthClient(c.env);
   const params = new URLSearchParams(new URL(c.req.url).search);
   const { session } = await client.callback(params);
-  const { headers } = await issueWebSession(c.env, session.did);
+  const token = await session.getTokenInfo(false);
+  const { headers } = await issueWebSession(c.env, session.did, {
+    grantedScope: token.scope,
+    scopeVersion: 1
+  });
   headers.set("Location", "/town");
   return new Response(null, { status: 302, headers });
 });

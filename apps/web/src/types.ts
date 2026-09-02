@@ -18,4 +18,6 @@ export interface CloudflareEnv {
   CLOUDFLARE_ACCOUNT_ID: string;
   CLOUDFLARE_API_TOKEN: string;
   PDS_HOSTNAME?: string;
+  PHASE2_PROBE_TOKEN?: string;
+  PHASE2_PROBE_COOKIE_KEY?: string;
 }
