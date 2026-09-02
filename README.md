@@ -89,26 +89,21 @@ env -u CLOUDFLARE_API_TOKEN nix develop -c pnpm deploy:web
   town feed merges optimistic D1 rows + local PDS repo reads + best-effort
   Bluesky search.
 
-## Pending (operator actions)
+## Operator status (2026-09-02)
 
-1. **Provisioner token (in progress)** — the W4P plan is purchased and both
-   dispatch namespaces are live (`netslum-sites-staging`,
-   `netslum-sites-production`, outbound → `netslum-site-egress`).
-   `SERVERLESS_ENABLED=true` is deployed, so every publish now provisions a
-   KV namespace + dispatch script via the Cloudflare API; that requires a
-   worker secret `CLOUDFLARE_API_TOKEN` with Workers Scripts Storage:Edit +
-   Workers KV Storage:Edit scopes (the zone-scoped one in env lacks them).
-   Tenant execution itself is already proven: see the runtime boundary
-   proofs below.
-2. **Render wildcard TLS (stuck)** — `*.pds.netslum.macha.sh` is added to the
-   PDS service and all three required DNS records exist and resolve
-   (`*` CNAME → onrender, `_acme-challenge` → `.verify.renderdns.com`,
-   `_cf-custom-hostname` → `.hostname.renderdns.com`, all DNS-only), but
-   Render's verification stays `unverified` after repeated API verify
-   triggers (~15 min). Needs the dashboard's Verify button (it displays the
-   exact records this domain object expects) or Render support. Until then,
-   handle subdomains have no TLS; `macha.pds.netslum.macha.sh` works via the
-   `_atproto` DNS TXT workaround.
+1. **Done** — Workers for Platforms is purchased and live: both dispatch
+   namespaces (staging + production, outbound → `netslum-site-egress`),
+   `SERVERLESS_ENABLED=true`, provisioner token secret set. The full
+   `_worker.js` publish pipeline is proven in production (see the runtime
+   boundary proofs below): staging validation → persistent KV → production
+   dispatch script → AT record swap → `/@macha` sandboxed iframe with a
+   working `apiBase`, tenant visits counter 1→2→3.
+2. **Done** — Render wildcard TLS issued: `*.pds.netslum.macha.sh` verified
+   (Let's Encrypt CN on the wildcard) after switching the
+   `_acme-challenge`/`_cf-custom-hostname` CNAMEs to the service-name form
+   (`netslum-pds.verify.renderdns.com` / `netslum-pds.hostname.renderdns.com`).
+   Handle subdomains now get native TLS; the `_atproto` TXT workaround for
+   `macha` remains as a harmless belt-and-suspenders.
 3. **Codex desktop acceptance run** — follow
    [docs/codex-acceptance-checklist.md](docs/codex-acceptance-checklist.md).
 
