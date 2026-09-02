@@ -20,10 +20,11 @@ import type { CloudflareEnv } from "./types.js";
 import { getOAuthClient, getPhase2ProbeOAuthClient } from "./server/auth/oauth.js";
 import { authenticateRequest, canPublishSite, issueWebSession, logout } from "./server/auth/session.js";
 import { AtprotoService } from "./server/social/AtprotoService.js";
-import { authenticateProbeRequest, issueProbeSession, logoutProbe, probeGated } from "./server/auth/probeSession.js";
+import { authenticateProbeRequest, issueProbeSession, logoutProbe, probeGated, requireProbeCsrf } from "./server/auth/probeSession.js";
 import { SiteService } from "./server/sites/SiteService.js";
-import { probeAppviewCapabilities } from "./server/auth/capabilityProbe.js";
+import { probeAppviewCapabilities, probeVideoCapabilities } from "./server/auth/capabilityProbe.js";
 import { ZoneRoom } from "./server/zones/ZoneRoom.js";
+import { Agent } from "@atproto/api";
 
 const app = new Hono<{ Bindings: CloudflareEnv }>();
 
@@ -144,7 +145,7 @@ app.get("/api/__phase2/probe/session", async (c) => {
   const client = await getPhase2ProbeOAuthClient(c.env);
   const session = await client.restore(auth.did);
   const token = await session.getTokenInfo(false);
-  return c.json({ did: auth.did, scope: token.scope, expiresAt: token.expiresAt?.toISOString() ?? null });
+  return c.json({ did: auth.did, scope: token.scope, expiresAt: token.expiresAt?.toISOString() ?? null }, 200, { "Cache-Control": "no-store" });
 });
 
 app.get("/api/__phase2/probe/capabilities", async (c) => {
@@ -153,16 +154,31 @@ app.get("/api/__phase2/probe/capabilities", async (c) => {
   const oauthSession = await client.restore(auth.did);
   const token = await oauthSession.getTokenInfo(false);
   const results = await probeAppviewCapabilities(oauthSession);
-  return c.json({ did: auth.did, scope: token.scope, results });
+  return c.json({ did: auth.did, scope: token.scope, results }, 200, { "Cache-Control": "no-store" });
+});
+
+app.post("/api/__phase2/probe/video", async (c) => {
+  const auth = await authenticateProbeRequest(c.req.raw, c.env);
+  requireProbeCsrf(c.req.raw, c.env);
+  const client = await getPhase2ProbeOAuthClient(c.env);
+  const oauthSession = await client.restore(auth.did);
+  const agent = new Agent(oauthSession as never);
+  const getSessionServiceAuth = async (aud: string, lxm: string): Promise<string> => {
+    const response = await agent.com.atproto.server.getServiceAuth({ aud, lxm, exp: Math.floor(Date.now() / 1000) + 1800 });
+    return response.data.token;
+  };
+  const video = await probeVideoCapabilities(oauthSession, getSessionServiceAuth);
+  return c.json({ did: auth.did, video }, 200, { "Cache-Control": "no-store" });
 });
 
 app.post("/api/__phase2/probe/logout", async (c) => {
   const auth = await authenticateProbeRequest(c.req.raw, c.env);
+  requireProbeCsrf(c.req.raw, c.env);
   const client = await getPhase2ProbeOAuthClient(c.env);
   await client.revoke(auth.did).catch(() => undefined);
   await c.env.DB.prepare("DELETE FROM oauth_probe_session WHERE did=?").bind(auth.did).run();
   const headers = await logoutProbe(c.req.raw, c.env);
-  return c.json({ ok: true }, 200, { "Set-Cookie": headers.getSetCookie()[0] ?? "" });
+  return c.json({ ok: true }, 200, { "Set-Cookie": headers.getSetCookie()[0] ?? "", "Cache-Control": "no-store" });
 });
 
 // OAuth Callback

@@ -52,6 +52,18 @@ export async function authenticateProbeRequest(request: Request, env: Cloudflare
   return { did: row.did };
 }
 
+export function requireProbeCsrf(request: Request, env: CloudflareEnv): void {
+  if (!env.PHASE2_PROBE_COOKIE_KEY) {
+    throw new NetslumError("NOT_FOUND", "Not found", 404);
+  }
+  // Temporary operator-only probe: the auth cookie stays HttpOnly, so the
+  // mutation guard is the strict same-site cookie plus an exact Origin check
+  // (the plan's CSRF-mirror pattern applies to the production app only).
+  if (request.headers.get("origin") !== env.PUBLIC_URL.replace(/\/$/, "")) {
+    throw new NetslumError("FORBIDDEN", "Request origin is not allowed", 403);
+  }
+}
+
 export async function logoutProbe(request: Request, env: CloudflareEnv): Promise<Headers> {
   const match = (request.headers.get("cookie") ?? "").match(new RegExp(`(?:^|;\\s*)${PROBE_COOKIE}=([^;]+)`));
   const token = match?.[1];
