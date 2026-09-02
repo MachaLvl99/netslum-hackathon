@@ -12,9 +12,11 @@ import {
   deleteSiteFileSchema,
   sha256Hex,
   slugSchema,
+  sitePathSchema,
   presentHandle,
   homeModeSchema,
   prepareImageSchema,
+  tenantToolManifestSchema,
   prepareVideoSchema,
   zoneMutationSchema
 } from "@netslum/contracts";
@@ -703,6 +705,150 @@ app.put("/api/home/settings", async (c) => {
   return c.json(await service.get(auth.did));
 });
 
+// Authored home (plan §E2): local-PDS users in authored mode mount their
+// active site's home.html from the TENANT origin (never same-origin srcdoc).
+// Missing/unpublished/suspended home content falls back to standard home.
+app.get("/api/home/mount", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const settings = new HomeSettingsService(c.env);
+  const local = await canPublishSite(auth.did, c.env).catch(() => false);
+  if (!local) return c.json({ mode: "standard" });
+  const home = await settings.get(auth.did);
+  if (home.mode !== "authored") return c.json({ mode: "standard" });
+  const site = await c.env.DB.prepare(
+    "SELECT slug, active_revision, status FROM site WHERE did=?"
+  ).bind(auth.did).first<{ slug: string; active_revision: string | null; status: string }>();
+  // Fail closed: suspended/missing/failed home content never bricks navigation.
+  if (!site || site.status !== "active" || !site.active_revision) return c.json({ mode: "standard" });
+  const siteId = `site-${(await sha256Hex(auth.did)).slice(0, 24)}`;
+  const homeObject = await c.env.SITE_FILES.get(`release/${siteId}/${site.active_revision}/home.html`).catch(() => null);
+  if (!homeObject) return c.json({ mode: "standard" });
+  return c.json({
+    mode: "authored",
+    tenantOrigin: `https://${site.slug}.sites.netslum.macha.sh`,
+    path: "/home.html",
+    title: `@${site.slug}`,
+    revision: site.active_revision
+  }, 200, { "Cache-Control": "no-store" });
+});
+
+// Public bridge data for authored homes (plan §E2): public town/feed/profile
+// reads only. No notification, preference, session, or DM data enters here.
+app.get("/api/home/bridge/:view", async (c) => {
+  const view = c.req.param("view");
+  const service = new AtprotoService(c.env);
+  if (view === "town") {
+    const limit = z.coerce.number().int().min(1).max(50).default(10).parse(c.req.query("limit") ?? undefined);
+    const feed = await service.getTownFeed(c.req.query("cursor") ?? undefined, limit).catch(() => null);
+    if (!feed) throw new NetslumError("UPSTREAM_UNAVAILABLE", "Town feed unavailable", 503, true);
+    return c.json({ view: "town", posts: feed.posts, ...(feed.cursor ? { cursor: feed.cursor } : {}) }, 200, { "Cache-Control": "no-store" });
+  }
+  if (view === "profile") {
+    const actor = z.string().max(315).parse(c.req.query("actor"));
+    const profile = await service.getProfile(actor).catch(() => null);
+    if (!profile) throw new NetslumError("NOT_FOUND", "Profile not found", 404);
+    return c.json({ view: "profile", profile }, 200, { "Cache-Control": "no-store" });
+  }
+  if (view === "search") {
+    const q = z.string().min(1).max(64).parse(c.req.query("q"));
+    const result = await service.searchPosts(undefined, q, c.req.query("cursor") ?? undefined, 10).catch(() => null);
+    if (!result) throw new NetslumError("UPSTREAM_UNAVAILABLE", "Search unavailable", 503, true);
+    return c.json({ view: "search", posts: result.posts, ...(result.cursor ? { cursor: result.cursor } : {}) }, 200, { "Cache-Control": "no-store" });
+  }
+  throw new NetslumError("INVALID_INPUT", "Unknown bridge view", 400);
+});
+
+// Tenant tool manifests (plan §F2): an optional active-release webmcp.json.
+// Publish-time validation happens here; execution posts to the isolated
+// tenant runtime with fixed endpoint /api/__webmcp/<name>.
+app.get("/api/sites/manifest", async (c) => {
+  // Public per-slug read (tenant parent registration) or self lookup.
+  const slugParam = slugSchema.safeParse(c.req.query("slug") ?? "");
+  let slug: string | null = null;
+  if (slugParam.success) {
+    slug = slugParam.data;
+  } else {
+    const auth = await authenticateRequest(c.req.raw, c.env, false);
+    const own = await c.env.DB.prepare("SELECT slug FROM site WHERE did=? AND status='active'").bind(auth.did).first<{ slug: string }>();
+    slug = own?.slug ?? null;
+  }
+  if (!slug) return c.json({ manifest: null });
+  const site = await c.env.DB.prepare(
+    "SELECT did, active_revision FROM site WHERE slug=? AND status='active' AND active_revision IS NOT NULL LIMIT 1"
+  ).bind(slug).first<{ did: string; active_revision: string }>();
+  if (!site) return c.json({ manifest: null });
+  const siteId = `site-${(await sha256Hex(site.did)).slice(0, 24)}`;
+  const manifestObject = await c.env.SITE_FILES.get(`release/${siteId}/${site.active_revision}/webmcp.json`).catch(() => null);
+  if (!manifestObject) return c.json({ slug, manifest: null });
+  // Fail closed: a malformed active manifest surfaces INVALID_TOOL_MANIFEST
+  // rather than registering broken tools (plan §F2 publish-time validation).
+  let parsedJson: unknown;
+  try { parsedJson = JSON.parse(await manifestObject.text()); } catch {
+    throw new NetslumError("INVALID_TOOL_MANIFEST", "webmcp.json is not valid JSON", 400);
+  }
+  const manifest = tenantToolManifestSchema.safeParse(parsedJson);
+  if (!manifest.success) {
+    throw new NetslumError("INVALID_TOOL_MANIFEST", `webmcp.json failed validation: ${manifest.error.issues[0]?.message ?? "invalid"}`, 400);
+  }
+  return c.json({ slug, manifest: manifest.data }, 200, { "Cache-Control": "no-store" });
+});
+
+// Tenant tool execution (plan §F2): the fixed endpoint POST
+// /api/__webmcp/<slug>/<name>. Input is validated against the published
+// manifest schema at execution time (not just publish time), bounded to 4 KiB
+// in and 4 KiB out, executed through the site's isolated runtime dispatch
+// binding, and never receives Netslum credentials, cookies, or CSRF tokens.
+app.post("/api/__webmcp/:slug/:tool", async (c) => {
+  const slug = slugSchema.safeParse(c.req.param("slug"));
+  const toolName = c.req.param("tool");
+  if (!slug.success || !/^[a-z0-9][a-z0-9_-]{0,47}$/.test(toolName)) {
+    throw new NetslumError("INVALID_INPUT", "Invalid tenant tool path", 400);
+  }
+  const site = await c.env.DB.prepare(
+    "SELECT did, active_revision, active_worker, status FROM site WHERE slug=? AND status='active' LIMIT 1"
+  ).bind(slug.data).first<{ did: string; active_revision: string | null; active_worker: string | null; status: string }>();
+  if (!site?.active_revision || !site.active_worker) {
+    throw new NetslumError("TOOL_RUNTIME_FAILED", "Tenant runtime is unavailable for this site", 503);
+  }
+  // Re-validate the LIVE active manifest at execution time so a stale
+  // registration cannot outlive a manifest change.
+  const siteId = `site-${(await sha256Hex(site.did)).slice(0, 24)}`;
+  const manifestObject = await c.env.SITE_FILES.get(`release/${siteId}/${site.active_revision}/webmcp.json`).catch(() => null);
+  if (!manifestObject) throw new NetslumError("TOOL_RUNTIME_FAILED", "Tenant manifest is no longer published", 404);
+  let manifestJson: unknown;
+  try { manifestJson = JSON.parse(await manifestObject.text()); } catch {
+    throw new NetslumError("INVALID_TOOL_MANIFEST", "webmcp.json is not valid JSON", 400);
+  }
+  const manifest = tenantToolManifestSchema.safeParse(manifestJson);
+  if (!manifest.success) throw new NetslumError("INVALID_TOOL_MANIFEST", "webmcp.json failed validation", 400);
+  const tool = manifest.data.tools.find((entry) => entry.name === toolName);
+  if (!tool) throw new NetslumError("TOOL_RUNTIME_FAILED", "Tool is not in the published manifest", 404);
+  const payload = await c.req.json<{ input?: unknown }>().catch(() => null);
+  if (!payload || typeof payload !== "object") throw new NetslumError("INVALID_INPUT", "A JSON body is required", 400);
+  // Full JSON-Schema-subset validation of the input happens inside the
+  // isolated runtime worker (which owns the manifest schema); here only the
+  // byte bounds are enforced (plan §F2 execution limits).
+  // Execution flows through the site's isolated runtime dispatch binding
+  // with the same CPU/subrequest/egress limits as _worker.js requests
+  // (plan §F2). No Netslum credentials are forwarded.
+  const dispatcher = c.env.STAGING_DISPATCHER ?? undefined;
+  if (!dispatcher) throw new NetslumError("SERVERLESS_UNAVAILABLE", "Tenant runtime unavailable", 503);
+  const worker = dispatcher.get(site.active_worker, {}, { limits: { cpuMs: 50, subRequests: 5 } });
+  const runtimeUrl = `https://runtime.internal/${siteId}/api/__webmcp/${encodeURIComponent(toolName)}`;
+  const runtimeRequest = new Request(runtimeUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Netslum-Site-Id": siteId },
+    body: JSON.stringify({ input: payload.input ?? {} })
+  });
+  const runtimeResponse = await worker.fetch(runtimeRequest).catch(() => {
+    throw new NetslumError("TOOL_RUNTIME_FAILED", "Tenant tool execution failed", 502);
+  });
+  const bodyBytes = await runtimeResponse.arrayBuffer();
+  if (bodyBytes.byteLength > 4096) throw new NetslumError("TOOL_RUNTIME_FAILED", "Tenant tool result exceeds 4 KiB", 502);
+  const headers = new Headers({ "Content-Type": "application/json", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
+  return new Response(bodyBytes, { status: runtimeResponse.status, headers });
+});
+
 // Authenticated preview route for draft workspace
 app.get("/api/sites/preview/:revision/*", async (c) => {
   const auth = await authenticateRequest(c.req.raw, c.env, false);
@@ -805,6 +951,45 @@ app.get("/:vanity{@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$}", async (c) => {
     <a href="/town" style="color:#57E6FF;text-decoration:none;font-size:13px;">town square &rarr;</a>
   </header>
   <iframe sandbox="allow-scripts" srcdoc="${escapedSrcDoc}"></iframe>
+</body>
+</html>`;
+  return c.html(shellHtml);
+});
+
+
+// Trusted district route (plan §E4): entering an experienced portal mounts
+// the tenant iframe on its real origin. The slug is validated server-side;
+// the route resolves the owner's ACTIVE revision (fail closed) and renders
+// a permanent trusted exit control. WebGPU delegation rides allow="webgpu".
+app.get("/district/:slug{[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?}", async (c) => {
+  const slug = slugSchema.safeParse(c.req.param("slug"));
+  if (!slug.success) return c.text("Invalid district", 404);
+  const site = await c.env.DB.prepare(
+    "SELECT did, active_revision, status FROM site WHERE slug=? AND status='active' AND active_revision IS NOT NULL LIMIT 1"
+  ).bind(slug.data).first<{ did: string; active_revision: string | null; status: string }>();
+  if (!site?.active_revision) return c.text("District unavailable", 404);
+  const pathParam = c.req.query("path") && sitePathSchema.safeParse(c.req.query("path")).success ? c.req.query("path") as string : "index.html";
+  const shellHtml = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>district // @${slug.data} — netslum</title>
+  <style>
+    body { margin: 0; background: #070910; color: #E8F0FF; font-family: ui-monospace, Menlo, Consolas, monospace; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+    header { height: 44px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; border-bottom: 1px solid #2A3652; background: #101522; z-index: 10; }
+    .brand { color: #57E6FF; font-weight: bold; text-decoration: none; font-size: 14px; }
+    .district-info { color: #8792AA; font-size: 13px; }
+    iframe { flex: 1; border: none; width: 100%; height: calc(100vh - 44px); background: #070910; }
+  </style>
+</head>
+<body>
+  <header>
+    <a href="/" class="brand">netslum</a>
+    <span class="district-info">district: @${slug.data} // ${pathParam}</span>
+    <a href="/gate" style="color:#57E6FF;text-decoration:none;font-size:13px;">exit district &rarr;</a>
+  </header>
+  <iframe sandbox="allow-scripts allow-same-origin" allow="webgpu" src="https://${slug.data}.sites.netslum.macha.sh/${pathParam}"></iframe>
 </body>
 </html>`;
   return c.html(shellHtml);

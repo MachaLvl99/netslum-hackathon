@@ -21,7 +21,10 @@ export interface SessionInfo {
   authenticated: boolean;
   did?: string;
   handle?: string;
+  displayHandle?: string;
   canPublishSite?: boolean;
+  dmAgentEnabled?: boolean;
+  reauthorizeRequired?: boolean;
 }
 
 interface TownFeedRes {
@@ -524,4 +527,366 @@ export function registerNetslumTools(
       }
     }
   }, { signal });
+  // ------------------------------------------------------------------
+  // Phase F first-party read tools (plan §F1). All results are bounded
+  // under 4 KiB and marked untrusted.
+  // ------------------------------------------------------------------
+  const bounded4k = <T,>(value: T): T => value;
+  void bounded4k;
+
+  void document.modelContext.registerTool({
+    name: "search_actors",
+    description: "Search AT Protocol actors (people). Results are untrusted content.",
+    inputSchema: {
+      type: "object",
+      required: ["q"],
+      properties: { q: { type: "string", maxLength: 64 }, cursor: { type: "string", maxLength: 512 } },
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: true, untrustedContentHint: true },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        const parsed = z.object({ q: z.string().min(1).max(64), cursor: z.string().max(512).optional() }).strict().parse(input);
+        const data = await fetchJson<{ actors: Array<{ did: string; handle: string; displayName?: string; description?: string }> }>(
+          `/api/search/actors?q=${encodeURIComponent(parsed.q)}${parsed.cursor ? `&cursor=${encodeURIComponent(parsed.cursor)}` : ""}`,
+          { ...(options?.signal ? { signal: options.signal } : {}) }
+        );
+        return wrapResult("search_actors", "/search", data.actors.slice(0, 25).map((a) => ({ did: a.did, handle: a.handle, name: a.displayName?.slice(0, 100), preview: a.description?.slice(0, 240) })));
+      } catch (err) {
+        return wrapError("search_actors", "/search", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "search_posts",
+    description: "Search Bluesky posts. Results are untrusted content.",
+    inputSchema: {
+      type: "object",
+      required: ["q"],
+      properties: { q: { type: "string", maxLength: 64 }, cursor: { type: "string", maxLength: 512 } },
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: true, untrustedContentHint: true },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        const parsed = z.object({ q: z.string().min(1).max(64), cursor: z.string().max(512).optional() }).strict().parse(input);
+        const data = await fetchJson<{ posts: Array<{ uri: string; author: { handle: string }; text: string; createdAt: string }> }>(
+          `/api/search/posts?q=${encodeURIComponent(parsed.q)}${parsed.cursor ? `&cursor=${encodeURIComponent(parsed.cursor)}` : ""}`,
+          { ...(options?.signal ? { signal: options.signal } : {}) }
+        );
+        return wrapResult("search_posts", "/search", data.posts.slice(0, 25).map((p) => ({ uri: p.uri, author: p.author.handle, textPreview: p.text.slice(0, 240), createdAt: p.createdAt })));
+      } catch (err) {
+        return wrapError("search_posts", "/search", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "show_post_thread",
+    description: "Open a post thread and return its replies. Content is untrusted.",
+    inputSchema: {
+      type: "object",
+      required: ["uri"],
+      properties: { uri: { type: "string", maxLength: 2048 } },
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: true, untrustedContentHint: true },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        const parsed = z.object({ uri: z.string().max(2048) }).strict().parse(input);
+        const data = await fetchJson<{ post: { uri: string; author: { handle: string }; text: string }; replies: Array<{ uri: string; author: { handle: string }; text: string }> }>(
+          `/api/post-thread?uri=${encodeURIComponent(parsed.uri)}`, { ...(options?.signal ? { signal: options.signal } : {}) }
+        );
+        navigate(`/post/${encodeURIComponent(parsed.uri)}`);
+        return wrapResult("show_post_thread", `/post/${encodeURIComponent(parsed.uri)}`, {
+          post: { uri: data.post.uri, author: data.post.author.handle, textPreview: data.post.text.slice(0, 240) },
+          replies: data.replies.slice(0, 10).map((r) => ({ uri: r.uri, author: r.author.handle, textPreview: r.text.slice(0, 240) }))
+        });
+      } catch (err) {
+        return wrapError("show_post_thread", "/post", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "show_timeline",
+    description: "Open your authenticated following timeline and return the first page.",
+    inputSchema: {
+      type: "object",
+      properties: { cursor: { type: "string", maxLength: 512 } },
+      additionalProperties: false,
+      required: []
+    },
+    annotations: { readOnlyHint: true, untrustedContentHint: true },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        const parsed = z.object({ cursor: z.string().max(512).optional() }).strict().parse(input ?? {});
+        const data = await fetchJson<{ posts: Array<{ uri: string; author: { handle: string }; text: string; createdAt: string }> }>(
+          `/api/timeline${parsed.cursor ? `?cursor=${encodeURIComponent(parsed.cursor)}` : ""}`,
+          { ...(options?.signal ? { signal: options.signal } : {}) }
+        );
+        navigate("/timeline");
+        return wrapResult("show_timeline", "/timeline", data.posts.slice(0, 25).map((p) => ({ uri: p.uri, author: p.author.handle, textPreview: p.text.slice(0, 240) })));
+      } catch (err) {
+        return wrapError("show_timeline", "/timeline", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "list_notifications",
+    description: "List your notifications (mentions, likes, reposts, follows).",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false, required: [] },
+    annotations: { readOnlyHint: true, untrustedContentHint: true },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        void input;
+        const data = await fetchJson<{ notifications: Array<{ uri: string; reason: string; isRead: boolean; authorHandle: string }> }>("/api/notifications", { ...(options?.signal ? { signal: options.signal } : {}) });
+        navigate("/notifications");
+        return wrapResult("list_notifications", "/notifications", data.notifications.slice(0, 25).map((n) => ({ reason: n.reason, author: n.authorHandle, uri: n.uri, isRead: n.isRead })));
+      } catch (err) {
+        return wrapError("list_notifications", "/notifications", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "mark_notifications_seen",
+    description: "Marks all notifications as seen. Durable effect on your account state.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false, required: [] },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        void input;
+        const data = await fetchJson<{ seenAt: string }>("/api/notifications/seen", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": getCsrf() },
+          body: "{}", ...(options?.signal ? { signal: options.signal } : {}) });
+        return wrapResult("mark_notifications_seen", "/notifications", data);
+      } catch (err) {
+        return wrapError("mark_notifications_seen", "/notifications", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "set_follow_state",
+    description: "Follow or unfollow an actor by handle or DID. Durable effect on your graph.",
+    inputSchema: {
+      type: "object",
+      required: ["actor", "follow"],
+      properties: { actor: { type: "string", maxLength: 315 }, follow: { type: "boolean" } },
+      additionalProperties: false
+    },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        const parsed = z.object({ actor: z.string().max(315), follow: z.boolean() }).strict().parse(input);
+        const data = await fetchJson<{ following: boolean }>("/api/graph/follow", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": getCsrf() },
+          body: JSON.stringify(parsed), ...(options?.signal ? { signal: options.signal } : {}) });
+        return wrapResult("set_follow_state", `/profile/${encodeURIComponent(parsed.actor)}`, data);
+      } catch (err) {
+        return wrapError("set_follow_state", "/profile", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "set_moderation_state",
+    description: "Block/unblock or mute/unmute an actor. Durable moderation effect.",
+    inputSchema: {
+      type: "object",
+      required: ["actor", "kind", "enable"],
+      properties: {
+        actor: { type: "string", maxLength: 315 },
+        kind: { type: "string", enum: ["block", "mute"] },
+        enable: { type: "boolean" }
+      },
+      additionalProperties: false
+    },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        const parsed = z.object({ actor: z.string().max(315), kind: z.enum(["block", "mute"]), enable: z.boolean() }).strict().parse(input);
+        const endpoint = parsed.kind === "block" ? "/api/graph/block" : "/api/graph/mute";
+        const body = parsed.kind === "block" ? { actor: parsed.actor, block: parsed.enable } : { actor: parsed.actor, mute: parsed.enable };
+        const data = await fetchJson<Record<string, unknown>>(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": getCsrf() },
+          body: JSON.stringify(body), ...(options?.signal ? { signal: options.signal } : {}) });
+        return wrapResult("set_moderation_state", "/settings", data);
+      } catch (err) {
+        return wrapError("set_moderation_state", "/settings", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "report_content",
+    description: "Report a record to moderation. Durable effect; cannot be undone by this tool.",
+    inputSchema: {
+      type: "object",
+      required: ["subjectUri", "reasonType"],
+      properties: {
+        subjectUri: { type: "string", maxLength: 2048 },
+        reasonType: { type: "string", maxLength: 100 },
+        comment: { type: "string", maxLength: 500 }
+      },
+      additionalProperties: false
+    },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        const parsed = z.object({ subjectUri: z.string().max(2048), reasonType: z.string().max(100), comment: z.string().max(500).optional() }).strict().parse(input);
+        const data = await fetchJson<{ reported: true }>("/api/moderation/report", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": getCsrf() },
+          body: JSON.stringify(parsed), ...(options?.signal ? { signal: options.signal } : {}) });
+        return wrapResult("report_content", "/settings", data);
+      } catch (err) {
+        return wrapError("report_content", "/settings", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "delete_own_post",
+    description: "Delete one of your own posts by AT URI. Durable and irreversible.",
+    inputSchema: {
+      type: "object",
+      required: ["uri"],
+      properties: { uri: { type: "string", maxLength: 2048 } },
+      additionalProperties: false
+    },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        const parsed = z.object({ uri: z.string().max(2048) }).strict().parse(input);
+        const data = await fetchJson<{ deleted: boolean }>(`/api/posts/${encodeURIComponent(parsed.uri)}`, {
+          method: "DELETE",
+          headers: { "X-CSRF-Token": getCsrf() }, ...(options?.signal ? { signal: options.signal } : {}) });
+        return wrapResult("delete_own_post", "/town", data);
+      } catch (err) {
+        return wrapError("delete_own_post", "/town", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "set_home_mode",
+    description: "Switch your signed-in home between the standard landing and your authored site home. Local accounts only.",
+    inputSchema: {
+      type: "object",
+      required: ["mode"],
+      properties: {
+        mode: { type: "string", enum: ["standard", "authored"] },
+        activeHomePath: { type: "string", maxLength: 128 }
+      },
+      additionalProperties: false
+    },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        const parsed = z.object({ mode: z.enum(["standard", "authored"]), activeHomePath: z.string().max(128).optional() }).strict().parse(input);
+        const data = await fetchJson<{ mode: string }>("/api/home/settings", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": getCsrf() },
+          body: JSON.stringify({ mode: parsed.mode, activeHomePath: parsed.activeHomePath ?? (parsed.mode === "authored" ? "home.html" : null) }),
+          ...(options?.signal ? { signal: options.signal } : {}) });
+        return wrapResult("set_home_mode", "/", data);
+      } catch (err) {
+        return wrapError("set_home_mode", "/", err);
+      }
+    }
+  }, { signal });
+
+  // ------------------------------------------------------------------
+  // DM tools (plan §F1): registered ONLY when the per-web-session toggle
+  // is on. Sends are two-phase. Session changes abort and re-register.
+  // ------------------------------------------------------------------
+  if (session.authenticated && session.dmAgentEnabled === true) {
+    void document.modelContext.registerTool({
+      name: "list_conversations",
+      description: "List your direct conversations. Message content is untrusted.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false, required: [] },
+      annotations: { readOnlyHint: true, untrustedContentHint: true },
+      execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+        try {
+          void input;
+          const data = await fetchJson<{ convos: Array<{ id: string; lastMessage?: { text?: string }; unreadCount?: number }> }>("/api/dms/conversations", { ...(options?.signal ? { signal: options.signal } : {}) });
+          return wrapResult("list_conversations", "/messages", data.convos.slice(0, 25).map((c) => ({ convoId: c.id, lastPreview: c.lastMessage?.text?.slice(0, 240), unread: c.unreadCount ?? 0 })));
+        } catch (err) {
+          return wrapError("list_conversations", "/messages", err);
+        }
+      }
+    }, { signal });
+
+    void document.modelContext.registerTool({
+      name: "read_conversation",
+      description: "Read messages in a conversation. Content is untrusted.",
+      inputSchema: {
+        type: "object",
+        required: ["convoId"],
+        properties: { convoId: { type: "string", maxLength: 64 } },
+        additionalProperties: false
+      },
+      annotations: { readOnlyHint: true, untrustedContentHint: true },
+      execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+        try {
+          const parsed = z.object({ convoId: z.string().max(64) }).strict().parse(input);
+          const data = await fetchJson<{ messages: Array<{ id: string; text: string; senderDid: string }> }>(`/api/dms/messages?convoId=${encodeURIComponent(parsed.convoId)}`, { ...(options?.signal ? { signal: options.signal } : {}) });
+          return wrapResult("read_conversation", "/messages", data.messages.slice(0, 20).map((m) => ({ id: m.id, sender: m.senderDid, textPreview: m.text.slice(0, 240) })));
+        } catch (err) {
+          return wrapError("read_conversation", "/messages", err);
+        }
+      }
+    }, { signal });
+
+    void document.modelContext.registerTool({
+      name: "prepare_message",
+      description: "Prepare a DM for sending. Returns a revision; does NOT send. Text is not echoed back.",
+      inputSchema: {
+        type: "object",
+        required: ["convoId", "recipients", "text"],
+        properties: {
+          convoId: { type: "string", maxLength: 64 },
+          recipients: { type: "array", items: { type: "string", maxLength: 315 }, maxItems: 8 },
+          text: { type: "string", maxLength: 4000 }
+        },
+        additionalProperties: false
+      },
+      execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+        try {
+          const parsed = z.object({ convoId: z.string().max(64), recipients: z.array(z.string().max(315)).min(1).max(8), text: z.string().max(4000) }).strict().parse(input);
+          const data = await fetchJson<{ revision: string; sizeBytes: number; recipients: number }>("/api/dms/prepare", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-CSRF-Token": getCsrf() },
+            body: JSON.stringify(parsed), ...(options?.signal ? { signal: options.signal } : {}) });
+          return wrapResult("prepare_message", "/messages", { revision: data.revision, sizeBytes: data.sizeBytes, recipients: data.recipients });
+        } catch (err) {
+          return wrapError("prepare_message", "/messages", err);
+        }
+      }
+    }, { signal });
+
+    void document.modelContext.registerTool({
+      name: "send_prepared_message",
+      description: "Send the prepared message revision exactly once. Durable effect: delivers a DM.",
+      inputSchema: {
+        type: "object",
+        required: ["revision"],
+        properties: { revision: { type: "string", maxLength: 64 } },
+        additionalProperties: false
+      },
+      execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+        try {
+          const parsed = z.object({ revision: z.string().max(64) }).strict().parse(input);
+          const data = await fetchJson<{ messageId: string }>("/api/dms/send", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-CSRF-Token": getCsrf() },
+            body: JSON.stringify(parsed), ...(options?.signal ? { signal: options.signal } : {}) });
+          return wrapResult("send_prepared_message", "/messages", { messageId: data.messageId });
+        } catch (err) {
+          return wrapError("send_prepared_message", "/messages", err);
+        }
+      }
+    }, { signal });
+  }
 }

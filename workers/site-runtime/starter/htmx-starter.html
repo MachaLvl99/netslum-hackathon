@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>netslum htmx starter</title>
+  <script src="/_netslum/htmx-1.9.12.min.js"></script>
+  <script>
+    // Secure starter profile (plan E3): no eval, no injected scripts, no
+    // history cache. Authors may replace these defaults; their code remains
+    // tenant-isolated either way.
+    htmx.config.allowEval = false;
+    htmx.config.allowScriptTags = false;
+    htmx.config.historyCacheSize = 0;
+    window.addEventListener("netslum:navigate", (event) => {
+      const detail = (event).detail;
+      if (detail && typeof detail.route === "string") {
+        window.parent.postMessage({ type: "netslum:trustedAction", action: "open-post", route: detail.route }, "https://netslum.macha.sh");
+      }
+    });
+  </script>
+  <style>
+    body { margin: 0; font-family: ui-monospace, Menlo, Consolas, monospace; background: #070910; color: #E8F0FF; padding: 16px; }
+    button { background: #101522; color: #57E6FF; border: 1px solid #2A3652; padding: 6px 12px; font: inherit; cursor: pointer; }
+    .post { border: 1px solid #2A3652; padding: 8px; margin: 8px 0; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h2>town fragments via same-origin /api</h2>
+  <button hx-get="/api/home/bridge/town?limit=5" hx-target="#town" hx-swap="innerHTML">load town posts</button>
+  <div id="town"></div>
+</body>
+</html>

@@ -259,6 +259,91 @@ function startLiveUpdates(pathname: string): void {
   if (zoneKey) connectZoneSocket(zoneKey);
 }
 
+let tenantTools: Array<{ name: string }> = [];
+
+/**
+ * Tenant tool manifests (plan §F2): while an authored home or district is
+ * mounted, the trusted parent fetches the site's validated webmcp.json and
+ * registers each tool as site.<slug>.<name> with a fixed execution endpoint.
+ * The iframe never receives the tools permission and never registers tools
+ * itself; all tenant tools carry untrustedContentHint. Registration rides
+ * the current abort signal so route/session/revision changes tear the set
+ * down with the rest.
+ */
+const registerTenantTools = async (
+  slug: string,
+  signal: AbortSignal
+): Promise<void> => {
+  if (typeof document === "undefined" || typeof document.modelContext?.registerTool !== "function") return;
+  let manifest: { tools: Array<{ name: string; title?: string; description: string; inputSchema: object }> } | null = null;
+  try {
+    const response = await fetch(`/api/sites/manifest?slug=${encodeURIComponent(slug)}`, { signal });
+    if (response.ok) {
+      const body = await response.json() as { manifest: { tools: Array<{ name: string; title?: string; description: string; inputSchema: object }> } | null };
+      manifest = body.manifest;
+    } else {
+      return;
+    }
+  } catch {
+    return;
+  }
+  if (!manifest || !Array.isArray(manifest.tools)) return;
+  for (const tool of manifest.tools.slice(0, 8)) {
+    if (!/^[a-z0-9][a-z0-9_-]{0,47}$/.test(tool.name)) continue;
+    try {
+      await document.modelContext.registerTool({
+        name: `site.${slug}.${tool.name}`,
+        title: tool.title ?? tool.name,
+        description: tool.description.slice(0, 500),
+        inputSchema: tool.inputSchema,
+        annotations: { untrustedContentHint: true },
+        execute: async (input: unknown): Promise<unknown> => {
+          // Fixed execution endpoint (plan §F2): the platform validates and
+          // proxies to the isolated tenant runtime; no credentials sent.
+          const response = await fetch(`/api/__webmcp/${slug}/${encodeURIComponent(tool.name)}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ input }),
+            signal: AbortSignal.timeout(10_000)
+          });
+          const body: unknown = await response.json().catch(() => ({}));
+          if (!response.ok) throw body;
+          return body;
+        }
+      }, { signal });
+      tenantTools.push({ name: `site.${slug}.${tool.name}` });
+    } catch {
+      // A single malformed tool never blocks the others (fail per-tool).
+    }
+  }
+};
+
+/**
+ * Authored home (plan §E2): a local member in authored mode mounts their
+ * site's home.html from the TENANT origin. The iframe is host-owned; the
+ * frozen window.__NETSLUM__ public bridge descriptor is injected there.
+ * Standard mode and every failure fall back to the standard home. The DOM
+ * element is the single source of truth for the mounted state.
+ */
+const resolveAuthoredHome = async (signal: AbortSignal): Promise<void> => {
+  document.getElementById("authored-home-mount")?.remove();
+  tenantTools = [];
+  if (location.pathname !== "/") return;
+  const mount = await apiJson<{ mode: string; tenantOrigin?: string; path?: string; title?: string }>("/api/home/mount");
+  if (mount.mode !== "authored" || !mount.tenantOrigin || !mount.path) return;
+  const iframe = document.createElement("iframe");
+  iframe.id = "authored-home-mount";
+  iframe.title = mount.title ?? "authored home";
+  iframe.setAttribute("sandbox", "allow-scripts allow-same-origin");
+  iframe.setAttribute("allow", "webgpu");
+  iframe.src = `${mount.tenantOrigin}${mount.path}`;
+  iframe.style.cssText = "position:fixed;inset:52px 0 0 0;width:100vw;height:calc(100vh - 52px);border:none;background:#070910;z-index:5;";
+  document.body.appendChild(iframe);
+  // Register the site's tenant tools while mounted (plan §F2).
+  const slug = new URL(mount.tenantOrigin).hostname.split(".")[0];
+  if (slug) await registerTenantTools(slug, signal);
+};
+
 const syncRoute = async (): Promise<void> => {
   const generation = ++routeGeneration;
   const pathname = location.pathname;
@@ -279,6 +364,7 @@ const syncRoute = async (): Promise<void> => {
   const zoneKey = zoneKeyForPath(pathname);
   if (zoneKey) await refreshZone(zoneKey);
   else clearZoneScene();
+  await resolveAuthoredHome(currentToolAbort.signal);
   if (pathname.startsWith("/profile/") && session.authenticated !== undefined) {
     const actor = decodeURIComponent(pathname.slice("/profile/".length));
     try {

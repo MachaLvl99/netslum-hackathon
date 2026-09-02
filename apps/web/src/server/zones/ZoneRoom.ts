@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { NetslumError, parseZoneKey, zoneMutationSchema, type PaletteToken, type ZoneMutation, type ZoneObject, type ZoneSnapshot } from "@netslum/contracts";
+import { NetslumError, experienceSchema, parseZoneKey, zoneMutationSchema, type PaletteToken, type ZoneMutation, type ZoneObject, type ZoneSnapshot } from "@netslum/contracts";
 import type { CloudflareEnv } from "../../types.js";
 
 interface MetaRow { [key: string]: string | number | null; key: string; value: number; }
@@ -64,6 +64,13 @@ export class ZoneRoom extends DurableObject<CloudflareEnv> {
       }
     } else if (row.type === "portal" && parsedPayload && typeof parsedPayload === "object" && "targetZoneKey" in parsedPayload && typeof parsedPayload.targetZoneKey === "string") {
       obj.targetZoneKey = parsedPayload.targetZoneKey;
+      // District experience (plan §E4): the portal's authored entry passes
+      // through validated (schema-constrained slug/path/title) so the trusted
+      // renderer can derive the tenant origin server-side.
+      if ("experience" in parsedPayload && parsedPayload.experience && typeof parsedPayload.experience === "object") {
+        const candidate = experienceSchema.safeParse(parsedPayload.experience);
+        if (candidate.success) obj.experience = candidate.data;
+      }
     }
     return obj;
   }

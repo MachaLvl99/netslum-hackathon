@@ -44,7 +44,21 @@ export function rewriteSiteHtml(html: string, options: RewriteSiteHtmlOptions): 
   const head = findElement(document, "head");
   if (!head) throw new TypeError("parse5 did not create a document head");
   removeAuthoredPolicy(document);
-  const bootstrap = JSON.stringify({ siteId: options.siteId, revision: options.revision, apiBase: options.apiBase }).replaceAll("<", "\\u003c");
+  // Public bridge descriptor (plan §E2): bounded public data endpoints and
+  // navigation requests only. No notification, preference, session, or DM
+  // data ever enters the descriptor; authenticated mutations are performed
+  // by the trusted parent through action sheets, never from tenant code.
+  const bootstrap = JSON.stringify({
+    siteId: options.siteId,
+    revision: options.revision,
+    apiBase: options.apiBase,
+    bridge: {
+      views: ["town", "profile", "search"],
+      fetchUrl: "/api/home/bridge/",
+      navigation: { event: "netslum:navigate", detail: { route: "string" } },
+      trustedActions: ["open-post", "open-profile", "open-conversation", "toggle-follow", "like-post", "reply-to-post"]
+    }
+  }).replaceAll("<", "\\u003c");
   const fragment = parseFragment(`<meta http-equiv="Content-Security-Policy" content="${siteContentSecurityPolicy(options.baseUrl).replaceAll("&", "&amp;").replaceAll('"', "&quot;")}"><base href="${base.href.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}"><script>Object.defineProperty(window,"__NETSLUM__",{value:Object.freeze(${bootstrap}),writable:false,configurable:false});</script>`);
   for (const node of [...fragment.childNodes].reverse()) {
     node.parentNode = head;

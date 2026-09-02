@@ -20,7 +20,15 @@ export const zoneKeySchema = z.string().refine((value) => {
 const coordinate = z.number().int().min(0).max(999);
 const noteValue = z.object({ type: z.literal("note"), x: coordinate, y: coordinate, text: z.string().min(1).max(280) }).strict();
 const sigilValue = z.object({ type: z.literal("sigil"), x: coordinate, y: coordinate, shape: z.enum(["circle", "triangle", "square", "star", "wave"]), color: z.enum(Object.keys(palette) as [keyof typeof palette, ...(keyof typeof palette)[]]) }).strict();
-const portalValue = z.object({ type: z.literal("portal"), x: coordinate, y: coordinate, targetZoneKey: zoneKeySchema }).strict();
+// District experience (plan §E4): an opt-in authored district entry. It can
+// only reference the owner's local site slug + a site path — never an
+// arbitrary origin; the tenant origin is derived server-side from the slug.
+export const experienceSchema = z.object({
+  siteSlug: z.string().max(64),
+  path: z.string().max(128).default("index.html"),
+  title: z.string().min(1).max(100)
+}).strict();
+const portalValue = z.object({ type: z.literal("portal"), x: coordinate, y: coordinate, targetZoneKey: zoneKeySchema, experience: experienceSchema.optional() }).strict();
 
 export const zoneOperationSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("place"), object: z.discriminatedUnion("type", [noteValue, sigilValue, portalValue]) }).strict(),
@@ -41,6 +49,7 @@ export type ZoneObject = {
   id: string; type: "note" | "sigil" | "portal"; x: number; y: number; ownerDid: string;
   createdAt: string; updatedAt: string; text?: string; shape?: "circle" | "triangle" | "square" | "star" | "wave";
   color?: keyof typeof palette; targetZoneKey?: string;
+  experience?: { siteSlug: string; path: string; title: string };
 };
 export type ZoneSnapshot = { zoneKey: string; version: number; objects: ZoneObject[] };
 
