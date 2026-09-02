@@ -12,20 +12,23 @@ import {
   deleteSiteFileSchema,
   sha256Hex,
   slugSchema,
+  presentHandle,
+  homeModeSchema,
   zoneMutationSchema
 } from "@netslum/contracts";
+import { OAUTH_SCOPE_VERSION, VIDEO_SERVICE_AUDIENCE } from "./server/auth/permissions.js";
 import { z } from "zod";
 import { rewriteSiteHtml } from "@netslum/sandbox";
 import type { CloudflareEnv } from "./types.js";
 import { getOAuthClient, getPhase2ProbeOAuthClient } from "./server/auth/oauth.js";
-import { authenticateRequest, canPublishSite, issueWebSession, logout } from "./server/auth/session.js";
+import { HomeSettingsService } from "./server/home/HomeSettingsService.js";
+import { authenticateRequest, canPublishSite, issueWebSession, logout, sessionCapabilities } from "./server/auth/session.js";
 import { AtprotoService } from "./server/social/AtprotoService.js";
 import { authenticateProbeRequest, issueProbeSession, logoutProbe, probeGated, requireProbeCsrf } from "./server/auth/probeSession.js";
 import { SiteService } from "./server/sites/SiteService.js";
 import { probeAppviewCapabilities } from "./server/auth/capabilityProbe.js";
 import { probeVideoPublish, probeVideoStart } from "./server/auth/videoSpike.js";
 import { probeDmBlockBehavior, probeDmLifecycle, probeDmNoneDenial } from "./server/auth/dmSpike.js";
-import { VIDEO_SERVICE_AUDIENCE } from "./server/auth/permissions.js";
 import { ZoneRoom } from "./server/zones/ZoneRoom.js";
 import { Agent } from "@atproto/api";
 
@@ -260,7 +263,7 @@ app.get("/oauth/callback", async (c) => {
   const token = await session.getTokenInfo(false);
   const { headers } = await issueWebSession(c.env, session.did, {
     grantedScope: token.scope,
-    scopeVersion: 1
+    scopeVersion: OAUTH_SCOPE_VERSION
   });
   headers.set("Location", "/town");
   return new Response(null, { status: 302, headers });
@@ -283,14 +286,23 @@ app.get("/api/session", async (c) => {
     } else if (auth.did.startsWith("did:web:")) {
       handle = decodeURIComponent(auth.did.split(":")[2] ?? auth.did).split(".")[0] ?? handle;
     }
+    // Phase 2: capabilities derive from the granted token (plan §A1). A
+    // session whose grant does not contain the current required scope set
+    // reports reauthorizeRequired; protected routes return
+    // REAUTHORIZE_REQUIRED instead of an opaque upstream 403.
+    const { reauthorizeRequired } = sessionCapabilities(auth.grantedScope, auth.scopeVersion, auth.dmAgentEnabled);
     return c.json({
       authenticated: true,
       did: auth.did,
       handle,
-      canPublishSite: allowed
+      displayHandle: presentHandle(handle),
+      canPublishSite: allowed,
+      reauthorizeRequired,
+      dmAgentEnabled: auth.dmAgentEnabled,
+      scopeVersion: auth.scopeVersion
     });
   } catch {
-    return c.json({ authenticated: false, canPublishSite: false });
+    return c.json({ authenticated: false, canPublishSite: false, reauthorizeRequired: false });
   }
 });
 
@@ -427,6 +439,29 @@ app.post("/api/sites/publish", async (c) => {
   const service = new SiteService(c.env);
   const result = await service.publish(auth.did, parsed);
   return c.json(result);
+});
+
+// Phase 2 home settings (plan §B6) — local-PDS users only.
+app.get("/api/home/settings", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const service = new HomeSettingsService(c.env);
+  // External identities always receive standard mode and no site row.
+  const local = await canPublishSite(auth.did, c.env).catch(() => false);
+  if (!local) return c.json({ mode: "standard", activeHomePath: null });
+  const settings = await service.get(auth.did);
+  return c.json(settings);
+});
+
+app.put("/api/home/settings", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const service = new HomeSettingsService(c.env);
+  await service.requireLocalPds(auth.did);
+  const parsed = z.object({
+    mode: homeModeSchema,
+    activeHomePath: z.string().max(128).nullable()
+  }).strict().parse(await c.req.json());
+  await service.set(auth.did, parsed);
+  return c.json(await service.get(auth.did));
 });
 
 // Authenticated preview route for draft workspace

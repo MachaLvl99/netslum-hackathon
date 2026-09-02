@@ -1,4 +1,5 @@
 import { NetslumError } from "@netslum/contracts";
+import { grantedScopeContainsRequired } from "./permissions.js";
 import type { CloudflareEnv } from "../../types.js";
 import { getOAuthClient } from "./oauth.js";
 import { hashToken, randomToken } from "./crypto.js";
@@ -16,7 +17,7 @@ function cookies(request: Request): Record<string, string> {
   return result;
 }
 
-export interface AuthenticatedSession { did: string; csrfToken: string; }
+export interface AuthenticatedSession { did: string; csrfToken: string; grantedScope: string | null; scopeVersion: number; dmAgentEnabled: boolean; }
 
 export interface IssuedWebSession { headers: Headers; csrfToken: string; }
 
@@ -50,14 +51,14 @@ export async function authenticateRequest(request: Request, env: CloudflareEnv, 
   const sessionToken = values[SESSION_COOKIE];
   const csrfToken = values[CSRF_COOKIE];
   if (!sessionToken || !csrfToken) throw new NetslumError("AUTH_REQUIRED", "Sign in is required", 401);
-  const row = await env.DB.prepare("SELECT did,csrf_hash,expires_at FROM web_session WHERE id_hash=?").bind(await hashToken(sessionToken)).first<{ did: string; csrf_hash: string; expires_at: number }>();
+  const row = await env.DB.prepare("SELECT did,csrf_hash,expires_at,granted_scope,scope_version,dm_agent_enabled FROM web_session WHERE id_hash=?").bind(await hashToken(sessionToken)).first<{ did: string; csrf_hash: string; expires_at: number; granted_scope: string | null; scope_version: number; dm_agent_enabled: number }>();
   if (!row || row.expires_at <= Date.now()) throw new NetslumError("AUTH_REQUIRED", "Session expired", 401);
   if (mutation) {
     if (request.headers.get("origin") !== env.PUBLIC_URL.replace(/\/$/, "")) throw new NetslumError("FORBIDDEN", "Request origin is not allowed", 403);
     const supplied = request.headers.get("x-csrf-token");
     if (!supplied || supplied !== csrfToken || await hashToken(supplied) !== row.csrf_hash) throw new NetslumError("FORBIDDEN", "CSRF validation failed", 403);
   }
-  return { did: row.did, csrfToken };
+  return { did: row.did, csrfToken, grantedScope: row.granted_scope, scopeVersion: row.scope_version, dmAgentEnabled: row.dm_agent_enabled === 1 };
 }
 
 export async function logout(request: Request, env: CloudflareEnv): Promise<Headers> {
@@ -90,4 +91,16 @@ export async function canPublishSite(did: string, env: CloudflareEnv): Promise<b
   const document = await resolveDidDocument(did);
   const endpoint = document.service?.find((service) => service.id === "#atproto_pds" || service.id === `${did}#atproto_pds`)?.serviceEndpoint;
   return typeof endpoint === "string" && endpoint.replace(/\/$/, "") === env.PDS_URL.replace(/\/$/, "");
+}
+
+export function sessionCapabilities(grantedScope: string | null, scopeVersion: number, dmAgentEnabled: boolean): {
+  reauthorizeRequired: boolean;
+  dmAgentEnabled: boolean;
+} {
+  // Phase 2 (plan §A1): capabilities derive from the granted token, not from
+  // requested metadata. A session without the current required grant reports
+  // reauthorizeRequired; protected routes surface REAUTHORIZE_REQUIRED.
+  const reauthorizeRequired = grantedScope === null || !grantedScopeContainsRequired(grantedScope);
+  void scopeVersion;
+  return { reauthorizeRequired, dmAgentEnabled };
 }

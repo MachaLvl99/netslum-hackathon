@@ -3,7 +3,7 @@ import { WebcryptoKey, NodeOAuthClient, requestLocalLock, type NodeSavedSession,
 import { AtprotoDohHandleResolver } from "@atproto-labs/handle-resolver";
 import type { CloudflareEnv } from "../../types.js";
 import { decryptJson, encryptJson, hashToken } from "./crypto.js";
-import { LEGACY_OAUTH_SCOPE, PHASE2_OAUTH_SCOPE } from "./permissions.js";
+import { PHASE2_OAUTH_SCOPE } from "./permissions.js";
 
 export function createWorkerFetch(baseFetch: typeof fetch = fetch): typeof fetch {
   return async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -165,7 +165,7 @@ export function getOAuthClient(env: CloudflareEnv): Promise<NodeOAuthClient> {
   const created = createOAuthClient(env, {
     clientMetadataPath: "/oauth-client-metadata.json",
     redirectPath: "/oauth/callback",
-    scope: LEGACY_OAUTH_SCOPE,
+    scope: PHASE2_OAUTH_SCOPE,
     sessionTable: "oauth_session",
     clientName: "netslum"
   });
