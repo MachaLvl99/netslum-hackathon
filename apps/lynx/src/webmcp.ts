@@ -797,6 +797,153 @@ export function registerNetslumTools(
     }
   }, { signal });
 
+
+  void document.modelContext.registerTool({
+    name: "show_actor_feed",
+    description: "Open an actor's profile feed and return their posts. Content is untrusted.",
+    inputSchema: {
+      type: "object",
+      required: ["actor"],
+      properties: { actor: { type: "string", maxLength: 315 }, cursor: { type: "string", maxLength: 512 } },
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: true, untrustedContentHint: true },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        const parsed = z.object({ actor: z.string().max(315), cursor: z.string().max(512).optional() }).strict().parse(input);
+        const data = await fetchJson<{ posts: Array<{ uri: string; author: { handle: string }; text: string; createdAt: string }> }>(
+          `/api/author-feed?actor=${encodeURIComponent(parsed.actor)}${parsed.cursor ? `&cursor=${encodeURIComponent(parsed.cursor)}` : ""}`,
+          { ...(options?.signal ? { signal: options.signal } : {}) }
+        );
+        navigate(`/profile/${encodeURIComponent(parsed.actor)}`);
+        return wrapResult("show_actor_feed", `/profile/${encodeURIComponent(parsed.actor)}`, data.posts.slice(0, 25).map((p) => ({ uri: p.uri, author: p.author.handle, textPreview: p.text.slice(0, 240) })));
+      } catch (err) {
+        return wrapError("show_actor_feed", "/profile", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "show_post_engagement",
+    description: "Show who liked, reposted, or quoted a post. Content is untrusted.",
+    inputSchema: {
+      type: "object",
+      required: ["uri", "kind"],
+      properties: {
+        uri: { type: "string", maxLength: 2048 },
+        kind: { type: "string", enum: ["likes", "reposts", "quotes"] }
+      },
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: true, untrustedContentHint: true },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        const parsed = z.object({ uri: z.string().max(2048), kind: z.enum(["likes", "reposts", "quotes"]) }).strict().parse(input);
+        const data = await fetchJson<{ actors: Array<{ did: string; handle: string }> }>(
+          `/api/post-engagement?uri=${encodeURIComponent(parsed.uri)}&kind=${parsed.kind}`,
+          { ...(options?.signal ? { signal: options.signal } : {}) }
+        );
+        return wrapResult("show_post_engagement", "/post", { kind: parsed.kind, actors: data.actors.slice(0, 25).map((a) => a.handle) });
+      } catch (err) {
+        return wrapError("show_post_engagement", "/post", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "list_saved_feeds",
+    description: "List your saved Bluesky feeds.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false, required: [] },
+    annotations: { readOnlyHint: true, untrustedContentHint: true },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        void input;
+        const data = await fetchJson<{ feeds: Array<Record<string, unknown>> }>("/api/feeds/saved", { ...(options?.signal ? { signal: options.signal } : {}) });
+        return wrapResult("list_saved_feeds", "/feeds", data.feeds.slice(0, 25).map((f) => ({ uri: typeof f.uri === "string" ? f.uri : "", pinned: Boolean(f.pinned) })));
+      } catch (err) {
+        return wrapError("list_saved_feeds", "/feeds", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "set_saved_feed",
+    description: "Save or remove a Bluesky feed generator by URI. Durable effect on your preferences.",
+    inputSchema: {
+      type: "object",
+      required: ["uri", "save"],
+      properties: {
+        uri: { type: "string", maxLength: 2048 },
+        cid: { type: "string", maxLength: 200 },
+        save: { type: "boolean" }
+      },
+      additionalProperties: false
+    },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        const parsed = z.object({ uri: z.string().max(2048), cid: z.string().max(200).optional(), save: z.boolean() }).strict().parse(input);
+        const data = await fetchJson<{ saved: boolean }>(parsed.save ? "/api/feeds/saved" : `/api/feeds/saved?uri=${encodeURIComponent(parsed.uri)}`, {
+          ...(parsed.save ? {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-CSRF-Token": getCsrf() },
+            body: JSON.stringify({ uri: parsed.uri, ...(parsed.cid ? { cid: parsed.cid } : {}) })
+          } : { method: "DELETE" }),
+          ...(options?.signal ? { signal: options.signal } : {})
+        });
+        return wrapResult("set_saved_feed", "/feeds", data);
+      } catch (err) {
+        return wrapError("set_saved_feed", "/feeds", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "update_profile",
+    description: "Update your display name or description. Durable effect on your profile record.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        displayName: { type: "string", maxLength: 640 },
+        description: { type: "string", maxLength: 2560 }
+      },
+      additionalProperties: false,
+      required: []
+    },
+    execute: async (input: unknown, options?: { signal?: AbortSignal }) => {
+      try {
+        const parsed = z.object({ displayName: z.string().max(640).optional(), description: z.string().max(2560).optional() }).strict().parse(input);
+        const data = await fetchJson<{ updated: boolean }>("/api/profile", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": getCsrf() },
+          body: JSON.stringify(parsed), ...(options?.signal ? { signal: options.signal } : {}) });
+        return wrapResult("update_profile", "/settings/profile", data);
+      } catch (err) {
+        return wrapError("update_profile", "/settings/profile", err);
+      }
+    }
+  }, { signal });
+
+  void document.modelContext.registerTool({
+    name: "open_personal_site",
+    description: "Open an actor's published personal site by slug.",
+    inputSchema: {
+      type: "object",
+      required: ["slug"],
+      properties: { slug: { type: "string", maxLength: 64 } },
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: true },
+    execute: (input: unknown) => {
+      try {
+        const parsed = z.object({ slug: z.string().max(64) }).strict().parse(input);
+        navigate(`/@${parsed.slug}`);
+        return wrapResult("open_personal_site", `/@${parsed.slug}`, { slug: parsed.slug });
+      } catch (err) {
+        return wrapError("open_personal_site", "/", err);
+      }
+    }
+  }, { signal });
+
   // ------------------------------------------------------------------
   // DM tools (plan §F1): registered ONLY when the per-web-session toggle
   // is on. Sends are two-phase. Session changes abort and re-register.

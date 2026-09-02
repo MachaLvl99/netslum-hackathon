@@ -8,7 +8,7 @@ export const preparePostSchema = z.object({ text: z.string().max(4000), replyToU
 export const publishPostSchema = z.object({ draftRevision: revisionSchema }).strict();
 export const reactionSchema = z.object({ uri: atUriSchema, cid: cidSchema, action: z.enum(["like", "unlike", "repost", "unrepost"]) }).strict();
 
-export type PostSummary = { uri: string; cid: string; author: { did: string; handle: string; displayName?: string }; text: string; createdAt: string };
+export type PostSummary = { uri: string; cid: string; author: { did: string; handle: string; displayName?: string }; text: string; createdAt: string; embeds?: Array<Record<string, unknown>> };
 
 export function deterministicPostRkey(draftRevision: string): string {
   return `netslum-${draftRevision.slice(0, 24)}`;

@@ -8,6 +8,7 @@ import {
 } from "@netslum/contracts";
 import { z } from "zod";
 import { getOAuthClient } from "../auth/oauth.js";
+import { MediaService } from "../media/MediaService.js";
 import type { CloudflareEnv } from "../../types.js";
 
 const postRecordSchema = z.object({ text: z.string().optional(), createdAt: z.string().optional() });
@@ -280,12 +281,30 @@ export class AtprotoService {
     return profile;
   }
 
-  async preparePost(actorDid: string, input: { text: string; replyToUri?: string; expectedRevision: string | null }): Promise<{ draftRevision: string; graphemes: number; bytes: number }> {
+  async preparePost(
+    actorDid: string,
+    input: {
+      text: string;
+      replyToUri?: string;
+      expectedRevision: string | null;
+      destination?: "town" | "bluesky";
+      quoteUri?: string;
+      quoteCid?: string;
+      languages?: string[];
+      mediaDraftIds?: string[];
+    }
+  ): Promise<{ draftRevision: string; graphemes: number; bytes: number }> {
+    // Plan §C3: 'town' appends exactly one #netslum suffix at publish time;
+    // 'bluesky' posts never carry the suffix. Destination is stored so publish
+    // is a pure function of the draft revision.
+    const destination = input.destination === "bluesky" ? "bluesky" : "town";
     const normalized = input.text.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
-    const fullText = `${normalized}\n\n#netslum`;
+    const fullText = destination === "town" ? `${normalized}\n\n#netslum` : normalized;
     const graphemes = graphemeLength(fullText);
     const bytes = new TextEncoder().encode(fullText).byteLength;
     if (graphemes > 300 || bytes > 3000) throw new NetslumError("INVALID_INPUT", "Post exceeds AT Protocol limits", 400);
+    if (input.mediaDraftIds && input.mediaDraftIds.length > 4) throw new NetslumError("INVALID_INPUT", "At most 4 media attachments", 400);
+    if (input.quoteUri && !input.quoteCid) throw new NetslumError("INVALID_INPUT", "A quote requires its CID", 400);
     const existing = await this.env.DB.prepare("SELECT draft_id,revision FROM post_draft WHERE did=?").bind(actorDid).first<DraftRow>();
     const extra1: { currentRevision?: string } = {};
     if (existing) extra1.currentRevision = existing.revision;
@@ -294,8 +313,21 @@ export class AtprotoService {
     if (existing?.revision) extra2.currentRevision = existing.revision;
     if (input.expectedRevision !== null && (!existing || existing.revision !== input.expectedRevision)) throw new NetslumError("STALE_REVISION", "Draft revision mismatch", 409, false, extra2);
     const draftId = existing?.draft_id ?? crypto.randomUUID();
-    const draftRevision = await sha256Hex(JSON.stringify({ draftId, did: actorDid, text: normalized, replyToUri: input.replyToUri ?? null }));
-    await this.env.DB.prepare("INSERT INTO post_draft(did,draft_id,revision,text,reply_to_uri,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(did) DO UPDATE SET revision=excluded.revision,text=excluded.text,reply_to_uri=excluded.reply_to_uri,updated_at=excluded.updated_at").bind(actorDid, draftId, draftRevision, normalized, input.replyToUri ?? null, Date.now()).run();
+    const draftRevision = await sha256Hex(JSON.stringify({
+      draftId, did: actorDid, text: fullText, replyToUri: input.replyToUri ?? null,
+      destination, quoteUri: input.quoteUri ?? null, quoteCid: input.quoteCid ?? null,
+      languages: input.languages ?? [], mediaDraftIds: input.mediaDraftIds ?? []
+    }));
+    await this.env.DB.prepare(
+      "INSERT INTO post_draft(did,draft_id,revision,text,reply_to_uri,destination,quote_uri,quote_cid,languages,media_draft_ids,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) " +
+      "ON CONFLICT(did) DO UPDATE SET revision=excluded.revision,text=excluded.text,reply_to_uri=excluded.reply_to_uri,destination=excluded.destination,quote_uri=excluded.quote_uri,quote_cid=excluded.quote_cid,languages=excluded.languages,media_draft_ids=excluded.media_draft_ids,updated_at=excluded.updated_at"
+    ).bind(
+      actorDid, draftId, draftRevision, fullText, input.replyToUri ?? null, destination,
+      input.quoteUri ?? null, input.quoteCid ?? null,
+      input.languages ? JSON.stringify(input.languages) : null,
+      input.mediaDraftIds ? JSON.stringify(input.mediaDraftIds) : null,
+      Date.now()
+    ).run();
     return { draftRevision, graphemes, bytes };
   }
 
@@ -339,12 +371,18 @@ export class AtprotoService {
 
 
     const draft = await this.env.DB.prepare(
-      "SELECT text,reply_to_uri FROM post_draft WHERE did=? AND revision=?"
-    ).bind(actorDid, draftRevision).first<{ text: string; reply_to_uri: string | null }>();
+      "SELECT text,reply_to_uri,destination,quote_uri,quote_cid,languages,media_draft_ids FROM post_draft WHERE did=? AND revision=?"
+    ).bind(actorDid, draftRevision).first<{
+      text: string; reply_to_uri: string | null; destination: string;
+      quote_uri: string | null; quote_cid: string | null;
+      languages: string | null; media_draft_ids: string | null;
+    }>();
     if (!draft) throw new NetslumError("STALE_REVISION", "Draft was modified or published", 409);
 
-    const fullText = `${draft.text}\n\n#netslum`;
-    const richText = new RichText({ text: fullText });
+    // The stored text already carries the #netslum suffix for town drafts
+    // (preparePost appended it); bluesky drafts publish as-is (plan §C3).
+    const fullText = draft.destination === "bluesky" ? draft.text : draft.text;
+    const richText = new RichText({ text: fullText, ...(draft.languages ? { langs: JSON.parse(draft.languages) as string[] } : {}) });
     await richText.detectFacets(agent);
     let reply: { root: { uri: string; cid: string }; parent: { uri: string; cid: string } } | undefined;
     if (draft.reply_to_uri) {
@@ -366,6 +404,29 @@ export class AtprotoService {
       };
     }
 
+    // Embeds (plan §C3/C4): quote embeds reference the quoted record; media
+    // embeds come from the actor's completed encrypted media drafts.
+    let embed: Record<string, unknown> | undefined;
+    const mediaRefs: Array<Record<string, unknown>> = [];
+    if (draft.media_draft_ids) {
+      const draftIds = JSON.parse(draft.media_draft_ids) as string[];
+      for (const mediaDraftId of draftIds.slice(0, 4)) {
+        try {
+          mediaRefs.push(await this.mediaBlobRef(actorDid, mediaDraftId));
+        } catch { /* a missing/expired draft attachment is skipped, not fatal */ }
+      }
+    }
+    if (draft.quote_uri && draft.quote_cid) {
+      const recordEmbed = { $type: "app.bsky.embed.record", record: { uri: draft.quote_uri, cid: draft.quote_cid } };
+      embed = mediaRefs.length === 1
+        ? { $type: "app.bsky.embed.record_with_media", record: recordEmbed, media: { $type: "app.bsky.embed.images", images: [mediaRefs[0]] } }
+        : recordEmbed;
+    } else if (mediaRefs.length === 1) {
+      embed = { $type: "app.bsky.embed.images", images: [mediaRefs[0]] };
+    } else if (mediaRefs.length > 1) {
+      embed = { $type: "app.bsky.embed.images", images: mediaRefs };
+    }
+
     const publishedAt = new Date().toISOString();
     const created = await agent.com.atproto.repo.createRecord({
       repo: actorDid,
@@ -375,6 +436,8 @@ export class AtprotoService {
         text: richText.text,
         facets: richText.facets,
         reply,
+        ...(embed ? { embed } : {}),
+        ...(draft.languages ? { langs: JSON.parse(draft.languages) as string[] } : {}),
         createdAt: publishedAt
       }
     });
@@ -390,6 +453,11 @@ export class AtprotoService {
   }
 
 
+  /** Resolves the completed blob ref for one of the actor's media drafts. */
+  private async mediaBlobRef(actorDid: string, draftId: string): Promise<Record<string, unknown>> {
+    const media = new MediaService(this.env);
+    return media.getBlob(actorDid, draftId);
+  }
   async reactToPost(actorDid: string, input: { uri: string; cid: string; action: "like" | "unlike" | "repost" | "unrepost" }): Promise<{ action: string; uri: string; active: boolean }> {
     const isLike = input.action === "like" || input.action === "unlike";
     const kind = isLike ? "like" : "repost";
@@ -464,7 +532,8 @@ export class AtprotoService {
       cid: post.cid,
       author,
       text: record?.text ?? "",
-      createdAt: record?.createdAt ?? new Date().toISOString()
+      createdAt: record?.createdAt ?? new Date().toISOString(),
+      ...(post.embed ? { embeds: [post.embed as unknown as Record<string, unknown>] } : {})
     };
   }
 
@@ -553,5 +622,131 @@ export class AtprotoService {
       posts: response.data.posts.map((post) => this.toPostSummary(post)),
       ...(response.data.cursor ? { cursor: response.data.cursor } : {})
     };
+  }
+
+  /** Saved/custom feeds (plan §C3): reads and writes go through the
+   * AppView-proxied preferences; only feed prefs are touched, other
+   * preference types pass through untouched. */
+  async getSavedFeeds(actorDid: string): Promise<Array<Record<string, unknown>>> {
+    const agent = await this.proxiedAgent(actorDid);
+    const response = await agent.app.bsky.actor.getPreferences({}, { signal: AbortSignal.timeout(8000) })
+      .catch(() => {
+        throw new NetslumError("UPSTREAM_UNAVAILABLE", "Preferences unavailable", 503, true);
+      });
+    return response.data.preferences.filter((entry) => (entry as { $type?: string }).$type === "app.bsky.actor.defs#savedFeedsPrefV2") as unknown as Array<Record<string, unknown>>;
+  }
+
+  async setSavedFeed(actorDid: string, input: { uri: string; cid?: string; pinned?: boolean }): Promise<{ saved: boolean }> {
+    const agent = await this.proxiedAgent(actorDid);
+    const current = await agent.app.bsky.actor.getPreferences({}, { signal: AbortSignal.timeout(8000) })
+      .catch(() => {
+        throw new NetslumError("UPSTREAM_UNAVAILABLE", "Preferences unavailable", 503, true);
+      });
+    const prefs = current.data.preferences as Array<Record<string, unknown>>;
+    const feedIndex = prefs.findIndex((entry) => (entry as { $type?: string }).$type === "app.bsky.actor.defs#savedFeedsPrefV2");
+    const feedPref = feedIndex >= 0 ? prefs[feedIndex] as { items?: Array<Record<string, unknown>> } : { $type: "app.bsky.actor.defs#savedFeedsPrefV2", items: [] };
+    const items = Array.isArray(feedPref.items) ? feedPref.items : [];
+    if (!items.some((item) => item.uri === input.uri)) {
+      items.push({ uri: input.uri, ...(input.cid ? { cid: input.cid } : {}), pinned: input.pinned !== false });
+    }
+    feedPref.items = items;
+    if (feedIndex >= 0) prefs[feedIndex] = feedPref; else prefs.push(feedPref);
+    await agent.app.bsky.actor.putPreferences({ preferences: prefs as never }, { signal: AbortSignal.timeout(8000) })
+      .catch(() => {
+        throw new NetslumError("UPSTREAM_UNAVAILABLE", "Saving feed failed", 502);
+      });
+    return { saved: true };
+  }
+
+  async unsetSavedFeed(actorDid: string, uri: string): Promise<{ saved: boolean }> {
+    const agent = await this.proxiedAgent(actorDid);
+    const current = await agent.app.bsky.actor.getPreferences({}, { signal: AbortSignal.timeout(8000) })
+      .catch(() => {
+        throw new NetslumError("UPSTREAM_UNAVAILABLE", "Preferences unavailable", 503, true);
+      });
+    const prefs = current.data.preferences as Array<Record<string, unknown>>;
+    const feedIndex = prefs.findIndex((entry) => (entry as { $type?: string }).$type === "app.bsky.actor.defs#savedFeedsPrefV2");
+    if (feedIndex >= 0) {
+      const feedPref = prefs[feedIndex] as { items?: Array<{ uri?: string }> };
+      if (Array.isArray(feedPref.items)) {
+        feedPref.items = feedPref.items.filter((item) => item.uri !== uri);
+        prefs[feedIndex] = feedPref;
+        await agent.app.bsky.actor.putPreferences({ preferences: prefs as never }, { signal: AbortSignal.timeout(8000) })
+          .catch(() => {
+            throw new NetslumError("UPSTREAM_UNAVAILABLE", "Preferences update failed", 502);
+          });
+      }
+    }
+    return { saved: false };
+  }
+
+  async getAuthorFeed(actorDid: string | undefined, actor: string, cursor?: string, limit = 25): Promise<{ posts: PostSummary[]; cursor?: string }> {
+    const agent = actorDid ? await this.proxiedAgent(actorDid) : await this.getAgent();
+    const response = await agent.app.bsky.feed.getAuthorFeed({ actor, limit, ...(cursor ? { cursor } : {}) }, { signal: AbortSignal.timeout(8000) })
+      .catch(() => {
+        throw new NetslumError("UPSTREAM_UNAVAILABLE", "Author feed unavailable", 503, true);
+      });
+    return {
+      posts: response.data.feed.map((entry) => this.toPostSummary(entry.post)),
+      ...(response.data.cursor ? { cursor: response.data.cursor } : {})
+    };
+  }
+
+  async getPostEngagement(actorDid: string | undefined, uri: string, kind: "likes" | "reposts" | "quotes", limit = 25): Promise<{ actors: Array<{ did: string; handle: string }>; cursor?: string }> {
+    const agent = actorDid ? await this.proxiedAgent(actorDid) : await this.getAgent();
+    if (kind === "likes") {
+      const response = await agent.app.bsky.feed.getLikes({ uri, limit }, { signal: AbortSignal.timeout(8000) })
+        .catch(() => {
+          throw new NetslumError("UPSTREAM_UNAVAILABLE", "Engagement unavailable", 503, true);
+        });
+      return { actors: response.data.likes.map((l) => ({ did: l.actor.did, handle: l.actor.handle })), ...(response.data.cursor ? { cursor: response.data.cursor } : {}) };
+    }
+    if (kind === "reposts") {
+      const response = await agent.app.bsky.feed.getRepostedBy({ uri, limit }, { signal: AbortSignal.timeout(8000) })
+        .catch(() => {
+          throw new NetslumError("UPSTREAM_UNAVAILABLE", "Engagement unavailable", 503, true);
+        });
+      return { actors: response.data.repostedBy.map((a) => ({ did: a.did, handle: a.handle })), ...(response.data.cursor ? { cursor: response.data.cursor } : {}) };
+    }
+    const response = await agent.app.bsky.feed.getQuotes({ uri, limit }, { signal: AbortSignal.timeout(8000) })
+      .catch(() => {
+        throw new NetslumError("UPSTREAM_UNAVAILABLE", "Engagement unavailable", 503, true);
+      });
+    return { actors: response.data.posts.map((p) => ({ did: p.author.did, handle: p.author.handle })), ...(response.data.cursor ? { cursor: response.data.cursor } : {}) };
+}
+
+  /** Profile edits (plan §C2): get-record then putRecord with swapCid so
+   * unknown/new fields are preserved and concurrent edits fail visibly. */
+  async updateOwnProfile(actorDid: string, input: { displayName?: string | null; description?: string | null; avatarRef?: Record<string, unknown> | null; bannerRef?: Record<string, unknown> | null }): Promise<{ updated: true }> {
+    const agent = await this.getAgent(actorDid);
+    const existing = await agent.com.atproto.repo.getRecord({
+      repo: actorDid,
+      collection: "app.bsky.actor.profile",
+      rkey: "self"
+    }).catch(() => undefined);
+    const current = existing ? existing.data.value as Record<string, unknown> : {};
+    const record: Record<string, unknown> = { $type: "app.bsky.actor.profile", ...current };
+    if (input.displayName !== undefined) {
+      if (input.displayName === null) delete record.displayName; else record.displayName = input.displayName;
+    }
+    if (input.description !== undefined) {
+      if (input.description === null) delete record.description; else record.description = input.description;
+    }
+    if (input.avatarRef !== undefined) {
+      if (input.avatarRef === null) delete record.avatar; else record.avatar = input.avatarRef;
+    }
+    if (input.bannerRef !== undefined) {
+      if (input.bannerRef === null) delete record.banner; else record.banner = input.bannerRef;
+    }
+    await agent.com.atproto.repo.putRecord({
+      repo: actorDid,
+      collection: "app.bsky.actor.profile",
+      rkey: "self",
+      record,
+      ...(existing?.data.cid ? { swapRecord: existing.data.cid } : {})
+    }, { signal: AbortSignal.timeout(10_000) }).catch((error) => {
+      throw new NetslumError("RECORD_CONFLICT", `Profile update conflicted: ${String((error as Error).message ?? error).slice(0, 120)}`, 409);
+    });
+    return { updated: true };
   }
 }

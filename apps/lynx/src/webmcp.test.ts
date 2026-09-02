@@ -37,9 +37,9 @@ describe("WebMCP tool registration", () => {
     expect(tools.map((t) => t.name)).toEqual(["show_town_square", "open_chaos_gate", "show_profile"]);
   });
 
-  it("registers all 23 first-party tools when authenticated", () => {
+  it("registers all 29 first-party tools when authenticated", () => {
     const tools = captureTools(true);
-    expect(tools).toHaveLength(23);
+    expect(tools).toHaveLength(29);
   });
 
   it("every schema is a closed object with explicit required and an abort signal", () => {

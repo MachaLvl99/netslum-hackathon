@@ -3,7 +3,8 @@ import {
   feedQuerySchema,
   NetslumError,
   parseZoneKey,
-  preparePostSchema,
+  preparePostSchemaV2,
+  updateProfileSchema,
   publishPostSchema,
   publishSiteSchema,
   reactionSchema,
@@ -343,14 +344,21 @@ app.get("/api/profile/:actor", async (c) => {
 app.put("/api/post-draft", async (c) => {
   const auth = await authenticateRequest(c.req.raw, c.env, true);
   const body: unknown = await c.req.json();
-  const rawInput = preparePostSchema.parse(body);
-  const input: { text: string; replyToUri?: string; expectedRevision: string | null } = {
-    text: rawInput.text,
-    expectedRevision: rawInput.expectedRevision
-  };
-  if (rawInput.replyToUri) input.replyToUri = rawInput.replyToUri;
+  // Phase 2 composer (plan §C3): destination, reply, quote, languages, and
+  // prepared media IDs ride the same draft. Legacy clients that omit
+  // destination default to 'town' (existing drafts migrate as town).
+  const parsed = preparePostSchemaV2.parse(body);
   const service = new AtprotoService(c.env);
-  const result = await service.preparePost(auth.did, input);
+  const result = await service.preparePost(auth.did, {
+    text: parsed.text,
+    expectedRevision: parsed.expectedRevision,
+    destination: parsed.destination,
+    ...(parsed.replyToUri !== undefined ? { replyToUri: parsed.replyToUri } : {}),
+    ...(parsed.quoteUri !== undefined ? { quoteUri: parsed.quoteUri } : {}),
+    ...(parsed.quoteCid !== undefined ? { quoteCid: parsed.quoteCid } : {}),
+    ...(parsed.languages !== undefined ? { languages: parsed.languages } : {}),
+    ...(parsed.mediaDraftIds !== undefined ? { mediaDraftIds: parsed.mediaDraftIds } : {})
+  });
   return c.json(result);
 });
 app.post("/api/posts/publish", async (c) => {
@@ -447,6 +455,31 @@ app.post("/api/media/image/prepare", async (c) => {
   return c.json(await service.prepareImage(auth.did, input));
 });
 
+
+// Saved/custom feeds (plan §C3): list and mutate through preferences.
+app.get("/api/feeds/saved", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const service = new AtprotoService(c.env);
+  return c.json({ feeds: await service.getSavedFeeds(auth.did) }, 200, { "Cache-Control": "no-store" });
+});
+
+app.post("/api/feeds/saved", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({ uri: z.string().max(2048), cid: z.string().max(200).optional(), pinned: z.boolean().optional() }).strict().parse(await c.req.json());
+  const service = new AtprotoService(c.env);
+  return c.json(await service.setSavedFeed(auth.did, {
+    uri: input.uri,
+    ...(input.cid !== undefined ? { cid: input.cid } : {}),
+    ...(input.pinned !== undefined ? { pinned: input.pinned } : {})
+  }));
+});
+
+app.delete("/api/feeds/saved", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const uri = z.string().max(2048).parse(c.req.query("uri"));
+  const service = new AtprotoService(c.env);
+  return c.json(await service.unsetSavedFeed(auth.did, uri));
+});
 app.post("/api/media/image/:draftId", async (c) => {
   const auth = await authenticateRequest(c.req.raw, c.env, true);
   const draftId = z.string().max(64).parse(c.req.param("draftId"));
@@ -482,6 +515,34 @@ app.get("/api/dms/requests", async (c) => {
   const limit = z.coerce.number().int().min(1).max(50).default(25).parse(c.req.query("limit") ?? undefined);
   const service = new ChatService(c.env);
   return c.json(await service.listRequests(auth.did, c.req.query("cursor") ?? undefined, limit), 200, { "Cache-Control": "no-store" });
+});
+
+app.get("/api/author-feed", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false).catch(() => null);
+  const actor = z.string().max(315).parse(c.req.query("actor"));
+  const limit = z.coerce.number().int().min(1).max(50).default(25).parse(c.req.query("limit") ?? undefined);
+  const service = new AtprotoService(c.env);
+  return c.json(await service.getAuthorFeed(auth?.did, actor, c.req.query("cursor") ?? undefined, limit), 200, { "Cache-Control": "no-store" });
+});
+
+app.get("/api/post-engagement", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false).catch(() => null);
+  const uri = z.string().max(2048).parse(c.req.query("uri"));
+  const kind = z.enum(["likes", "reposts", "quotes"]).parse(c.req.query("kind"));
+  const service = new AtprotoService(c.env);
+  return c.json(await service.getPostEngagement(auth?.did, uri, kind), 200, { "Cache-Control": "no-store" });
+});
+
+app.put("/api/profile", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = updateProfileSchema.parse(await c.req.json());
+  const service = new AtprotoService(c.env);
+  return c.json(await service.updateOwnProfile(auth.did, {
+    ...(input.displayName !== undefined ? { displayName: input.displayName } : {}),
+    ...(input.description !== undefined ? { description: input.description } : {}),
+    ...(input.avatarRef !== undefined ? { avatarRef: input.avatarRef } : {}),
+    ...(input.bannerRef !== undefined ? { bannerRef: input.bannerRef } : {})
+  }));
 });
 
 app.get("/api/dms/conversation", async (c) => {
