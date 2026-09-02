@@ -120,12 +120,22 @@ app.get("/api/session", async (c) => {
   try {
     const auth = await authenticateRequest(c.req.raw, c.env, false);
     const client = await getOAuthClient(c.env);
-    const oauthSession = await client.restore(auth.did).catch(() => undefined);
+    await client.restore(auth.did).catch(() => undefined);
     const allowed = await canPublishSite(auth.did, c.env).catch(() => false);
+    let handle = auth.did;
+    if (auth.did.startsWith("did:plc:")) {
+      const plc = await fetch(`https://plc.directory/${encodeURIComponent(auth.did)}`, { signal: AbortSignal.timeout(4000) })
+        .then((r) => (r.ok ? r.json() : null) as Promise<{ alsoKnownAs?: string[] } | null>)
+        .catch(() => null);
+      const atHandle = plc?.alsoKnownAs?.find((id) => id.startsWith("at://"));
+      if (atHandle) handle = atHandle.slice("at://".length);
+    } else if (auth.did.startsWith("did:web:")) {
+      handle = decodeURIComponent(auth.did.split(":")[2] ?? auth.did).split(".")[0] ?? handle;
+    }
     return c.json({
       authenticated: true,
       did: auth.did,
-      handle: (oauthSession as { handle?: string })?.handle ?? auth.did,
+      handle,
       canPublishSite: allowed
     });
   } catch {
