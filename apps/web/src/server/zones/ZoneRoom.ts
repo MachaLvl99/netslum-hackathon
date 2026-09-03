@@ -155,7 +155,7 @@ export class ZoneRoom extends DurableObject<CloudflareEnv> {
             let payload: object = {};
             if (op.object.type === "note") payload = { text: op.object.text };
             else if (op.object.type === "sigil") payload = { shape: op.object.shape, color: op.object.color };
-            else if (op.object.type === "portal") payload = { targetZoneKey: op.object.targetZoneKey };
+            else if (op.object.type === "portal") payload = { targetZoneKey: op.object.targetZoneKey, ...(op.object.experience ? { experience: op.object.experience } : {}) };
 
             sql.exec(
               "INSERT INTO zone_object(id, type, x, y, owner_did, payload_json, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",

@@ -2,7 +2,7 @@ import js from "@eslint/js";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["**/.next/**", "**/.open-next/**", "**/dist/**", "**/dist-types/**", "**/generated/**", "**/.wrangler/**", "infra/tranquil/vendor/**", "playwright-report/**", "test-results/**", "apps/lynx/scripts/**", "scripts/**", "*.config.*", "**/*.config.*", "**/env*.d.ts", "apps/web/public/**"] },
+  { ignores: ["**/.next/**", "**/.open-next/**", "**/dist/**", "**/dist-types/**", "**/generated/**", "**/.wrangler/**", "infra/tranquil/vendor/**", "playwright-report/**", "test-results/**", "apps/lynx/scripts/**", "scripts/**", "*.config.*", "**/*.config.*", "**/env*.d.ts", "apps/web/public/**", "workers/site-runtime/starter/**", "**/*.min.js"] },
   js.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,
   {

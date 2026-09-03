@@ -85,7 +85,7 @@ export const updateProfileSchema = z.object({
   description: z.string().max(2560).nullable().optional(),
   avatarRef: z.record(z.string(), z.unknown()).nullable().optional(),
   bannerRef: z.record(z.string(), z.unknown()).nullable().optional()
-}).strict();
+}).strip();
 
 // ---------------------------------------------------------------------------
 // Posts and embeds
@@ -138,6 +138,25 @@ export const feedPageSchema = z.object({
 export type FeedPage = z.infer<typeof feedPageSchema>;
 
 export const feedViewSchema = z.object({ posts: z.array(postSchema).max(50), cursor: feedCursorSchema.optional() }).strict();
+export const feedGeneratorSchema = z.object({
+  uri: z.string().max(2048),
+  cid: z.string().max(200),
+  displayName: z.string().max(640),
+  description: z.string().max(2560).optional(),
+  avatar: z.string().max(2048).optional(),
+  creator: z.object({
+    did: didSchema,
+    handle: z.string().max(315),
+    displayName: z.string().max(640).optional()
+  }).strict()
+}).strict();
+export type FeedGenerator = z.infer<typeof feedGeneratorSchema>;
+
+export const feedGeneratorPageSchema = z.object({
+  feeds: z.array(feedGeneratorSchema).max(50),
+  cursor: feedCursorSchema.optional()
+}).strict();
+export type FeedGeneratorPage = z.infer<typeof feedGeneratorPageSchema>;
 
 // ---------------------------------------------------------------------------
 // Search

@@ -6,6 +6,7 @@ export interface CloudflareEnv {
   SITE_FILES: R2Bucket;
   ZONES: DurableObjectNamespace<ZoneRoom>;
   STAGING_DISPATCHER?: DispatchNamespace;
+  SITE_RUNTIME?: Fetcher;
   PUBLIC_URL: string;
   PDS_URL: string;
   BSKY_PUBLIC_API: string;
@@ -18,7 +19,5 @@ export interface CloudflareEnv {
   CLOUDFLARE_ACCOUNT_ID: string;
   CLOUDFLARE_API_TOKEN: string;
   PDS_HOSTNAME?: string;
-  PHASE2_PROBE_TOKEN?: string;
-  PHASE2_PROBE_COOKIE_KEY?: string;
   PRIVATE_DATA_KEY?: string;
 }

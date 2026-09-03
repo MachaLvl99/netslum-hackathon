@@ -21,6 +21,12 @@ export class GraphService {
     if (!session) throw new NetslumError("AUTH_REQUIRED", "Please sign in again", 401);
     return new Agent(session);
   }
+  private async appviewAgent(actorDid?: string): Promise<Agent> {
+    const agent = await this.getAgent(actorDid);
+    if (actorDid) agent.configureProxy("did:web:api.bsky.app#bsky_appview");
+    return agent;
+  }
+
 
   async resolveActor(actorInput: string): Promise<{ did: string; handle: string }> {
     const agent = await this.getAgent();
@@ -32,7 +38,7 @@ export class GraphService {
   }
 
   async getRelationships(actorDid: string, subjects: readonly string[]): Promise<Array<Record<string, unknown>>> {
-    const agent = await this.getAgent(actorDid);
+    const agent = await this.appviewAgent(actorDid);
     const response = await agent.app.bsky.graph.getRelationships({ actor: actorDid, others: [...subjects] }, { signal: AbortSignal.timeout(8000) }).catch(() => {
       throw new NetslumError("UPSTREAM_UNAVAILABLE", "Relationship lookup unavailable", 503, true);
     });
@@ -102,8 +108,7 @@ export class GraphService {
   async setMuteState(actorDid: string, targetDid: string, mute: boolean): Promise<{ muted: boolean }> {
     // Mutes are AppView state (not repo records), so the call is proxied to
     // did:web:api.bsky.app#bsky_appview like every other app.bsky.* call.
-    const agent = await this.getAgent(actorDid);
-    agent.configureProxy("did:web:api.bsky.app#bsky_appview");
+    const agent = await this.appviewAgent(actorDid);
     try {
       if (mute) {
         await agent.app.bsky.graph.muteActor({ actor: targetDid }, { signal: AbortSignal.timeout(8000) });
@@ -133,7 +138,7 @@ export class GraphService {
 
 
   async searchActors(actorDid: string | undefined, query: string, limit: number, cursor?: string): Promise<{ actors: Array<{ did: string; handle: string; displayName?: string; description?: string; avatar?: string; followers?: number }>; cursor?: string }> {
-    const agent = await this.getAgent(actorDid);
+    const agent = await this.appviewAgent(actorDid);
     const response = await agent.app.bsky.actor.searchActors({ q: query, limit, ...(cursor ? { cursor } : {}) }, { signal: AbortSignal.timeout(8000) });
     const actors = response.data.actors.map((entry) => ({
       did: entry.did,

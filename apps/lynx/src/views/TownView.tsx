@@ -1,5 +1,6 @@
-import type { LynxInputEvent, PostItem } from "./types.js";
+import type { PostItem } from "./types.js";
 import { FEATURED_ZONES } from "./types.js";
+import { FeedList } from "./FeedList.js";
 
 export interface TownViewProps {
   compact: boolean;
@@ -7,6 +8,8 @@ export interface TownViewProps {
   setActivePane: (pane: "world" | "feed") => void;
   authenticated: boolean;
   feedStale: boolean;
+  destination: "town" | "bluesky";
+  setDestination: (value: "town" | "bluesky") => void;
   postText: string;
   setPostText: (value: string) => void;
   postBusy: boolean;
@@ -22,6 +25,8 @@ export function TownView(props: TownViewProps) {
     setActivePane,
     authenticated,
     feedStale,
+    destination,
+    setDestination,
     postText,
     setPostText,
     postBusy,
@@ -55,16 +60,28 @@ export function TownView(props: TownViewProps) {
 
         {authenticated ? (
           <view className="composer-card">
-            <text className="composer-label">BROADCAST TO #NETSLUM</text>
+            <text className="composer-label">COMPOSE</text>
+            <view className="composer-destinations">
+              <text
+                className={destination === "town" ? "dest-chip active" : "dest-chip"}
+                bindtap={() => setDestination("town")}
+              >#netslum</text>
+              <text
+                className={destination === "bluesky" ? "dest-chip active" : "dest-chip"}
+                bindtap={() => setDestination("bluesky")}
+              >bluesky</text>
+            </view>
             <input
               className="composer-input"
-              placeholder="Share notes, thoughts, or directives with the slum..."
-              value={postText}
-              bindinput={(e: LynxInputEvent) => setPostText(e.detail.value)}
+              placeholder={destination === "town" ? "Share notes, thoughts, or directives with the slum..." : "Post to your Bluesky followers..."}
+              default-value={postText}
+              bindinput={(e) => setPostText(e.detail.value)}
             />
             <view className="composer-footer">
-              <text className="char-count">{postText.length + 10} / 300</text>
-              <text className={postBusy ? "primary-sm busy" : "primary-sm"} bindtap={submitPost}>{postBusy ? "PUBLISHING…" : "POST TO FEDIVERSE"}</text>
+              <text className="char-count">{postText.length + (destination === "town" ? 10 : 0)} / 300</text>
+              <text className={postBusy ? "primary-sm busy" : "primary-sm"} bindtap={submitPost}>
+                {postBusy ? "PUBLISHING…" : destination === "town" ? "POST TO #NETSLUM" : "POST TO BLUESKY"}
+              </text>
             </view>
           </view>
         ) : (
@@ -73,23 +90,11 @@ export function TownView(props: TownViewProps) {
           </view>
         )}
 
-        <view className="feed-list">
-          {posts.length > 0 ? (
-            posts.map((p) => (
-              <view key={p.uri} className="post-card">
-                <view className="post-header">
-                  <text className="post-author">@{p.author.handle}</text>
-                  <text className="post-time">{new Date(p.createdAt).toLocaleTimeString()}</text>
-                </view>
-                <text className="post-body">{p.text}</text>
-              </view>
-            ))
-          ) : (
-            <view className="empty-card">
-              <text className="empty-text">No posts yet on #netslum. Be the first to broadcast!</text>
-            </view>
-          )}
-        </view>
+        <FeedList
+          posts={posts}
+          navigate={navigate}
+          emptyText="No posts yet on #netslum. Be the first to broadcast!"
+        />
       </view>
     </view>
   );

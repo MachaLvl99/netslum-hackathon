@@ -7,6 +7,7 @@ import {
   siteRevision,
   slugSchema,
   validateSiteBundle,
+  tenantToolManifestSchema,
   type SiteFile
 } from "@netslum/contracts";
 import { transform } from "esbuild";
@@ -37,6 +38,22 @@ interface ReleaseRow {
   status: "staged" | "active" | "superseded";
   created_at: number;
   published_at: number | null;
+}
+
+/** The auto-seeded starter page HTML for a given site slug. */
+function starterHtmlFor(label: string): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>@${label}</title>
+  <style>body{background:#070910;color:#E8F0FF;font-family:monospace;padding:48px;}</style>
+</head>
+<body>
+  <h1>@${label}</h1>
+  <p>Welcome to my personal site on netslum.</p>
+</body>
+</html>`;
 }
 
 export class SiteService {
@@ -87,18 +104,7 @@ export class SiteService {
       throw new NetslumError("INVALID_HANDLE", "Handle label is invalid for personal site slug", 400);
     }
 
-    const starterHtml = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>@${firstLabel}</title>
-  <style>body{background:#070910;color:#E8F0FF;font-family:monospace;padding:48px;}</style>
-</head>
-<body>
-  <h1>@${firstLabel}</h1>
-  <p>Welcome to my personal site on netslum.</p>
-</body>
-</html>`;
+    const starterHtml = starterHtmlFor(firstLabel);
     const htmlBytes = new TextEncoder().encode(starterHtml);
     const htmlSha = await sha256Hex(htmlBytes);
     const initialFiles: SiteFile[] = [
@@ -132,7 +138,7 @@ export class SiteService {
     return { siteId, site };
   }
 
-  async listFiles(siteId: string, prefix: string): Promise<SiteFile[]> {
+  async listFiles(_siteId: string, prefix: string): Promise<SiteFile[]> {
     const listed = await this.env.SITE_FILES.list({ prefix: prefix.endsWith("/") ? prefix : `${prefix}/`, include: ["customMetadata"] });
     const files: SiteFile[] = [];
     for (const object of listed.objects) {
@@ -144,10 +150,20 @@ export class SiteService {
     return files.sort((a, b) => a.path.localeCompare(b.path));
   }
 
-  async getDraft(actorDid: string, handle?: string): Promise<{ slug: string; revision: string; files: SiteFile[] }> {
+  async getDraft(
+    actorDid: string,
+    handle?: string
+  ): Promise<{ slug: string; revision: string; files: SiteFile[]; activeRevision: string | null; isStarter: boolean }> {
     const { siteId, site } = await this.getOrCreateSite(actorDid, handle);
     const files = await this.listFiles(siteId, `draft/${siteId}/${site.draft_revision}`);
-    return { slug: site.slug, revision: site.draft_revision, files };
+    // An untouched auto-seeded starter counts as "nothing built yet" (Phase 3).
+    let isStarter = false;
+    const soleIndex = files.length === 1 ? files[0] : undefined;
+    if (!site.active_revision && soleIndex?.path === "index.html") {
+      const starterSha = await sha256Hex(new TextEncoder().encode(starterHtmlFor(site.slug)));
+      isStarter = soleIndex.sha256 === starterSha;
+    }
+    return { slug: site.slug, revision: site.draft_revision, files, activeRevision: site.active_revision, isStarter };
   }
 
   async readFile(
@@ -160,7 +176,6 @@ export class SiteService {
     const key = `draft/${siteId}/${site.draft_revision}/${parsedPath}`;
     const object = await this.env.SITE_FILES.get(key);
     if (!object) throw new NetslumError("NOT_FOUND", `File not found: ${parsedPath}`, 404);
-
     const mimeType = object.customMetadata?.mimeType ?? "application/octet-stream";
     const isText = mimeType.startsWith("text/") || mimeType === "application/javascript" || mimeType === "application/json" || mimeType === "image/svg+xml";
 
@@ -248,6 +263,58 @@ export class SiteService {
     return { revision: nextRevision };
   }
 
+  async getPageSchema(actorDid: string, fileName = "personal_page.json"): Promise<{ schema: Record<string, unknown> | null; revision: string }> {
+    const { siteId, site } = await this.getOrCreateSite(actorDid);
+    const fileObj = await this.env.SITE_FILES.get(`draft/${siteId}/${site.draft_revision}/${fileName}`);
+    if (!fileObj) return { schema: null, revision: site.draft_revision };
+    try {
+      const text = await fileObj.text();
+      const schema = JSON.parse(text) as Record<string, unknown>;
+      return { schema, revision: site.draft_revision };
+    } catch {
+      return { schema: null, revision: site.draft_revision };
+    }
+  }
+
+  async savePageSchema(
+    actorDid: string,
+    schema: Record<string, unknown>,
+    handle?: string,
+    fileName = "personal_page.json"
+  ): Promise<{ revision: string }> {
+    const { site } = await this.getOrCreateSite(actorDid, handle);
+    const jsonContent = JSON.stringify(schema, null, 2);
+    return await this.saveFile(
+      actorDid,
+      {
+        path: fileName,
+        content: jsonContent,
+        encoding: "utf8",
+        contentType: "application/json",
+        expectedRevision: site.draft_revision
+      },
+      handle
+    );
+  }
+
+  async getPublicPageSchema(slugOrDid: string, fileName = "personal_page.json"): Promise<{ slug: string; did: string; schema: Record<string, unknown> | null }> {
+    const row = await this.env.DB.prepare(
+      "SELECT did, slug, active_revision, draft_revision, status FROM site WHERE slug = ? OR did = ?"
+    ).bind(slugOrDid, slugOrDid).first<{ did: string; slug: string; active_revision: string | null; draft_revision: string; status: string }>();
+    if (!row || row.status !== "active") return { slug: slugOrDid, did: "", schema: null };
+    const siteId = `site-${(await sha256Hex(row.did)).slice(0, 24)}`;
+    const rev = row.active_revision ?? row.draft_revision;
+    const prefix = row.active_revision ? `release/${siteId}/${rev}` : `draft/${siteId}/${rev}`;
+    const fileObj = await this.env.SITE_FILES.get(`${prefix}/${fileName}`);
+    if (!fileObj) return { slug: row.slug, did: row.did, schema: null };
+    try {
+      const text = await fileObj.text();
+      return { slug: row.slug, did: row.did, schema: JSON.parse(text) as Record<string, unknown> };
+    } catch {
+      return { slug: row.slug, did: row.did, schema: null };
+    }
+  }
+
   async deleteFile(
     actorDid: string,
     input: { path: string; expectedRevision: string },
@@ -321,6 +388,18 @@ export class SiteService {
       const computedRevision = await siteRevision(draftFiles);
       if (computedRevision !== input.revision) {
         throw new NetslumError("STALE_REVISION", "Draft revision hash mismatch", 409);
+      }
+      const webmcpFile = draftFiles.find((f) => f.path === "webmcp.json");
+      if (webmcpFile) {
+        const webmcpObj = await this.env.SITE_FILES.get(`draft/${siteId}/${input.revision}/webmcp.json`);
+        if (!webmcpObj) throw new NetslumError("NOT_FOUND", "webmcp.json file missing", 404);
+        try {
+          const text = await webmcpObj.text();
+          const json: unknown = JSON.parse(text);
+          tenantToolManifestSchema.parse(json);
+        } catch {
+          throw new NetslumError("INVALID_TOOL_MANIFEST", "Invalid webmcp.json manifest", 400);
+        }
       }
 
       const workerFile = draftFiles.find((f) => f.path === "_worker.js");

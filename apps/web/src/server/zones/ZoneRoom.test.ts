@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { zoneMutationSchema, type ZoneMutation } from "@netslum/contracts";
+import { zoneMutationSchema, experienceSchema, type ZoneMutation } from "@netslum/contracts";
 
 describe("Zone mutation logic and validations", () => {
   it("parses valid place, move, edit, and delete operations", () => {
@@ -77,5 +77,72 @@ describe("Zone mutation logic and validations", () => {
       operations: [{ op: "place", object: { type: "portal", x: 100, y: 100, targetZoneKey: "invalid.key" } }]
     });
     expect(invalidPortal.success).toBe(false);
+  });
+
+  it("accepts portal with experience and preserves it through payload round-trip", () => {
+    // Schema acceptance: portal place with experience
+    const withExperience = zoneMutationSchema.safeParse({
+      expectedVersion: 0,
+      operations: [{
+        op: "place",
+        object: {
+          type: "portal",
+          x: 500,
+          y: 500,
+          targetZoneKey: "burning.market.static",
+          experience: { siteSlug: "macha", path: "index.html", title: "Macha District" }
+        }
+      }]
+    });
+    expect(withExperience.success).toBe(true);
+    if (!withExperience.success) return;
+
+    // Simulate the payload construction from ZoneRoom.place handler (line 158)
+    const op = withExperience.data.operations[0]!;
+    if (op.op !== "place") return;
+    const obj = op.object;
+    if (obj.type !== "portal") return;
+    const payload = {
+      targetZoneKey: obj.targetZoneKey,
+      ...(obj.experience ? { experience: obj.experience } : {})
+    };
+
+    // Verify experience is stored in the serialized payload
+    const serialized = JSON.stringify(payload);
+    const parsed = JSON.parse(serialized) as Record<string, unknown>;
+    expect(parsed.targetZoneKey).toBe("burning.market.static");
+    expect(parsed.experience).toBeDefined();
+
+    // Simulate the read path from rowToObject (lines 70-73)
+    const candidate = experienceSchema.safeParse(parsed.experience);
+    expect(candidate.success).toBe(true);
+    if (candidate.success) {
+      expect(candidate.data.siteSlug).toBe("macha");
+      expect(candidate.data.path).toBe("index.html");
+      expect(candidate.data.title).toBe("Macha District");
+    }
+  });
+
+  it("portal without experience still works (backward compat)", () => {
+    const withoutExperience = zoneMutationSchema.safeParse({
+      expectedVersion: 0,
+      operations: [{
+        op: "place",
+        object: { type: "portal", x: 100, y: 100, targetZoneKey: "silent.garden.rain" }
+      }]
+    });
+    expect(withoutExperience.success).toBe(true);
+    if (!withoutExperience.success) return;
+
+    const op = withoutExperience.data.operations[0]!;
+    if (op.op !== "place") return;
+    const obj = op.object;
+    if (obj.type !== "portal") return;
+    const payload = {
+      targetZoneKey: obj.targetZoneKey,
+      ...(obj.experience ? { experience: obj.experience } : {})
+    };
+    expect(payload).toEqual({ targetZoneKey: "silent.garden.rain" });
+    expect("experience" in payload).toBe(false);
   });
 });

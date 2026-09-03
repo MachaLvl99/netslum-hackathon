@@ -55,7 +55,9 @@ export function sceneParamsFromSeed(seed: string, width: number): ZoneSceneParam
   const shuffled = [...TOKENS];
   for (let i = shuffled.length - 1; i > 0; i--) {
     const j = Math.floor(rand() * (i + 1));
-    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    const left = shuffled[i]!;
+    shuffled[i] = shuffled[j]!;
+    shuffled[j] = left;
   }
   const density = 0.25 + rand() * 0.5;
   const glowX = 0.15 + rand() * 0.7;

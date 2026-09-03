@@ -31,7 +31,6 @@ function stateStore(env: CloudflareEnv): NodeSavedStateStore {
     async get(key) {
       const hash = await hashToken(key);
       const row = await env.DB.prepare("SELECT payload,expires_at FROM oauth_state WHERE key_hash=?").bind(hash).first<{ payload: ArrayBuffer | Uint8Array; expires_at: number }>();
-      await env.DB.prepare("DELETE FROM oauth_state WHERE key_hash=?").bind(hash).run();
       if (!row || row.expires_at <= Date.now()) return undefined;
       const rawPayload = row.payload instanceof Uint8Array ? row.payload : new Uint8Array(row.payload);
       return decryptJson<NodeSavedState>(rawPayload, env.OAUTH_STORE_KEY);
@@ -40,36 +39,25 @@ function stateStore(env: CloudflareEnv): NodeSavedStateStore {
   };
 }
 
-function sessionStore(env: CloudflareEnv, table: "oauth_session" | "oauth_probe_session"): NodeSavedSessionStore {
-  const isProbe = table === "oauth_probe_session";
+function sessionStore(env: CloudflareEnv): NodeSavedSessionStore {
   return {
     async set(did, value) {
       const payload = await encryptJson(value, env.OAUTH_STORE_KEY);
       const now = Date.now();
-      if (isProbe) {
-        await env.DB.prepare(
-          "INSERT INTO oauth_probe_session(did,payload,updated_at,expires_at) VALUES(?,?,?,?) " +
-          "ON CONFLICT(did) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at,expires_at=excluded.expires_at"
-        ).bind(did, payload.slice().buffer, now, now + 60 * 60_000).run();
-      } else {
-        await env.DB.prepare(
-          "INSERT INTO oauth_session(did,payload,updated_at) VALUES(?,?,?) " +
-          "ON CONFLICT(did) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at"
-        ).bind(did, payload.slice().buffer, now).run();
-      }
+      await env.DB.prepare(
+        "INSERT INTO oauth_session(did,payload,updated_at) VALUES(?,?,?) " +
+        "ON CONFLICT(did) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at"
+      ).bind(did, payload.slice().buffer, now).run();
     },
     async get(did) {
-      const row = isProbe
-        ? await env.DB.prepare("SELECT payload,expires_at FROM oauth_probe_session WHERE did=?").bind(did).first<{ payload: ArrayBuffer | Uint8Array; expires_at: number }>()
-        : await env.DB.prepare("SELECT payload FROM oauth_session WHERE did=?").bind(did).first<{ payload: ArrayBuffer | Uint8Array; expires_at?: number }>();
+      const row = await env.DB.prepare("SELECT payload FROM oauth_session WHERE did=?").bind(did).first<{ payload: ArrayBuffer | Uint8Array; expires_at?: number }>();
       if (!row || (row.expires_at !== undefined && row.expires_at <= Date.now())) {
-        if (isProbe && row) await env.DB.prepare("DELETE FROM oauth_probe_session WHERE did=?").bind(did).run();
         return undefined;
       }
       const rawPayload = row.payload instanceof Uint8Array ? row.payload : new Uint8Array(row.payload);
       return decryptJson<NodeSavedSession>(rawPayload, env.OAUTH_STORE_KEY);
     },
-    async del(did) { await env.DB.prepare(`DELETE FROM ${table} WHERE did=?`).bind(did).run(); }
+    async del(did) { await env.DB.prepare("DELETE FROM oauth_session WHERE did=?").bind(did).run(); }
   };
 }
 
@@ -77,13 +65,10 @@ interface OAuthClientVariant {
   clientMetadataPath: string;
   redirectPath: string;
   scope: string;
-  sessionTable: "oauth_session" | "oauth_probe_session";
   clientName: string;
 }
 
 const productionClients = new WeakMap<object, Promise<NodeOAuthClient>>();
-const probeClients = new WeakMap<object, Promise<NodeOAuthClient>>();
-
 function createOAuthClient(env: CloudflareEnv, variant: OAuthClientVariant): Promise<NodeOAuthClient> {
   return (async () => {
     const rawUrl = env.PUBLIC_URL.replace(/\/$/, "");
@@ -136,7 +121,7 @@ function createOAuthClient(env: CloudflareEnv, variant: OAuthClientVariant): Pro
       keyset: [key],
       handleResolver,
       stateStore: stateStore(env),
-      sessionStore: sessionStore(env, variant.sessionTable),
+      sessionStore: sessionStore(env),
       requestLock: requestLocalLock,
       runtimeImplementation: {
         requestLock: requestLocalLock,
@@ -166,23 +151,8 @@ export function getOAuthClient(env: CloudflareEnv): Promise<NodeOAuthClient> {
     clientMetadataPath: "/oauth-client-metadata.json",
     redirectPath: "/oauth/callback",
     scope: PHASE2_OAUTH_SCOPE,
-    sessionTable: "oauth_session",
     clientName: "netslum"
   });
   productionClients.set(env, created);
-  return created;
-}
-
-export function getPhase2ProbeOAuthClient(env: CloudflareEnv): Promise<NodeOAuthClient> {
-  const cached = probeClients.get(env);
-  if (cached) return cached;
-  const created = createOAuthClient(env, {
-    clientMetadataPath: "/oauth-v2-probe-client-metadata.json",
-    redirectPath: "/oauth/v2-probe/callback",
-    scope: PHASE2_OAUTH_SCOPE,
-    sessionTable: "oauth_probe_session",
-    clientName: "netslum phase 2 capability probe"
-  });
-  probeClients.set(env, created);
   return created;
 }

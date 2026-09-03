@@ -1,8 +1,8 @@
 import { z } from "zod";
 
 export const zonePrefixes = ["hidden", "burning", "silent", "wandering", "broken", "electric"] as const;
-export const zonePlaces = ["archive", "garden", "cathedral", "market", "labyrinth", "harbor"] as const;
-export const zoneStates = ["dawn", "echo", "rain", "static", "dream", "void"] as const;
+export const zonePlaces = ["archive", "garden", "cathedral", "market", "labyrinth", "harbor", "forbidden"] as const;
+export const zoneStates = ["dawn", "echo", "rain", "static", "dream", "void", "holy_ground"] as const;
 export const palette = {
   cyan: "#57E6FF", violet: "#8B5CFF", magenta: "#FF4FD8", amber: "#FFBF47",
   mint: "#62F6B5", cobalt: "#4E7BFF", coral: "#FF6B6B", silver: "#C8D1E1"

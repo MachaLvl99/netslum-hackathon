@@ -21,25 +21,21 @@ import {
   prepareVideoSchema,
   zoneMutationSchema
 } from "@netslum/contracts";
-import { OAUTH_SCOPE_VERSION, VIDEO_SERVICE_AUDIENCE } from "./server/auth/permissions.js";
+import { OAUTH_SCOPE_VERSION } from "./server/auth/permissions.js";
 import { z, ZodError } from "zod";
 import { rewriteSiteHtml } from "@netslum/sandbox";
 import type { CloudflareEnv } from "./types.js";
-import { getOAuthClient, getPhase2ProbeOAuthClient } from "./server/auth/oauth.js";
+import { getOAuthClient } from "./server/auth/oauth.js";
+import { randomToken, hashToken } from "./server/auth/crypto.js";
 import { MediaService } from "./server/media/MediaService.js";
 import { GraphService } from "./server/social/GraphService.js";
 import { ChatService } from "./server/social/ChatService.js";
 import { DmDraftService } from "./server/social/DmDraftService.js";
-import { authenticateRequest, canPublishSite, issueWebSession, logout, sessionCapabilities } from "./server/auth/session.js";
+import { authenticateRequest, canPublishSite, issueWebSession, logout, sessionCapabilities, resolveDidDocument, type AuthenticatedSession } from "./server/auth/session.js";
 import { AtprotoService } from "./server/social/AtprotoService.js";
 import { HomeSettingsService } from "./server/home/HomeSettingsService.js";
-import { authenticateProbeRequest, issueProbeSession, logoutProbe, probeGated, requireProbeCsrf } from "./server/auth/probeSession.js";
-import { SiteService } from "./server/sites/SiteService.js";
-import { probeAppviewCapabilities } from "./server/auth/capabilityProbe.js";
-import { probeVideoPublish, probeVideoStart } from "./server/auth/videoSpike.js";
-import { probeDmBlockBehavior, probeDmLifecycle, probeDmNoneDenial } from "./server/auth/dmSpike.js";
 import { ZoneRoom } from "./server/zones/ZoneRoom.js";
-import { Agent } from "@atproto/api";
+import { SiteService } from "./server/sites/SiteService.js";
 
 const app = new Hono<{ Bindings: CloudflareEnv }>();
 
@@ -74,15 +70,26 @@ app.onError((err, c) => {
 // Health check
 app.get("/health", (c) => c.json({ ok: true }));
 
-// Static & Lynx bundle proxy routes
-app.get("/main.web.bundle", (c) => c.env.ASSETS.fetch(new Request(new URL("/main.web.bundle", c.req.url), c.req.raw)));
-app.get("/host.js", (c) => c.env.ASSETS.fetch(new Request(new URL("/host.js", c.req.url), c.req.raw)));
-app.get("/static/*", (c) => c.env.ASSETS.fetch(c.req.raw));
-app.get("/binary/*", (c) => c.env.ASSETS.fetch(c.req.raw));
-app.get("/decodeWorker/*", (c) => c.env.ASSETS.fetch(c.req.raw));
-app.get("/common/*", (c) => c.env.ASSETS.fetch(c.req.raw));
-app.get("/constants.js", (c) => c.env.ASSETS.fetch(c.req.raw));
-app.get("/wasm.js", (c) => c.env.ASSETS.fetch(c.req.raw));
+// Static & Lynx bundle assets — `no-cache` (not max-age): deploys ship new
+// code but Cloudflare's edge would otherwise serve the old copy for up to 5
+// minutes and users would need to hard-refresh. The browser revalidates via
+// ETag (304 when unchanged, fresh body the moment a deploy lands). The
+// revalidation cost for these once-per-load files is negligible.
+const cacheAsset = async (c: { env: { ASSETS: Fetcher }; req: { url: string; raw: Request } }, path: string) => {
+  const res = await c.env.ASSETS.fetch(new Request(new URL(path, c.req.url), c.req.raw));
+  if (!res.ok) return res;
+  const cached = new Response(res.body, res);
+  cached.headers.set("Cache-Control", "no-cache");
+  return cached;
+};
+app.get("/main.web.bundle", (c) => cacheAsset(c, "/main.web.bundle"));
+app.get("/host.js", (c) => cacheAsset(c, "/host.js"));
+app.get("/static/*", (c) => cacheAsset(c, new URL(c.req.url).pathname));
+app.get("/binary/*", (c) => cacheAsset(c, new URL(c.req.url).pathname));
+app.get("/decodeWorker/*", (c) => cacheAsset(c, new URL(c.req.url).pathname));
+app.get("/common/*", (c) => cacheAsset(c, new URL(c.req.url).pathname));
+app.get("/constants.js", (c) => cacheAsset(c, "/constants.js"));
+app.get("/wasm.js", (c) => cacheAsset(c, "/wasm.js"));
 
 // OAuth metadata endpoints
 app.get("/oauth-client-metadata.json", async (c) => {
@@ -95,10 +102,6 @@ app.get("/oauth-client-metadata.json", async (c) => {
   }
 });
 
-app.get("/oauth-v2-probe-client-metadata.json", async (c) => {
-  const client = await getPhase2ProbeOAuthClient(c.env);
-  return c.json(client.clientMetadata);
-});
 
 app.get("/.well-known/jwks.json", async (c) => {
   try {
@@ -131,191 +134,76 @@ app.get("/oauth/login", async (c) => {
   return c.redirect(url.toString(), 302);
 });
 
-// Temporary Phase 2 capability client, operator-gated by a Bearer launch
-// token and a separate cookie/session namespace. Production login keeps the
-// proven Phase 1 scope until this exact grant succeeds on both Tranquil and
-// Bluesky; these routes are removed before Phase 2 ships.
-app.get("/oauth/v2-probe/login", async (c) => {
-  await probeGated(c.env, c.req.raw);
-  let target = (c.req.query("handle") ?? "").trim().replace(/^@/, "");
-  if (!target) throw new NetslumError("INVALID_INPUT", "A probe handle is required", 400);
-  if (!target.startsWith("did:") && !target.startsWith("http://") && !target.startsWith("https://") && !target.includes(".")) {
-    target = `${target}.${c.env.PDS_HOSTNAME ?? "pds.netslum.macha.sh"}`;
-  }
-  const client = await getPhase2ProbeOAuthClient(c.env);
-  const url = await client.authorize(target, { state: crypto.randomUUID() });
-  return c.redirect(url.toString(), 302);
-});
-
-app.get("/oauth/v2-probe/callback", async (c) => {
-  const client = await getPhase2ProbeOAuthClient(c.env);
-  const params = new URLSearchParams(new URL(c.req.url).search);
-  const redirectUri = `${c.env.PUBLIC_URL.replace(/\/$/, "")}/oauth/v2-probe/callback`;
-  const { session } = await client.callback(params, { redirect_uri: redirectUri as `https://${string}` });
-  await session.getTokenInfo(false);
-  const headers = await issueProbeSession(c.env, session.did);
-  headers.set("Location", "/api/__phase2/probe/session");
-  return new Response(null, { status: 302, headers });
-});
-
-app.get("/api/__phase2/probe/session", async (c) => {
-  const auth = await authenticateProbeRequest(c.req.raw, c.env);
-  const client = await getPhase2ProbeOAuthClient(c.env);
-  const session = await client.restore(auth.did);
-  const token = await session.getTokenInfo(false);
-  return c.json({ did: auth.did, scope: token.scope, expiresAt: token.expiresAt?.toISOString() ?? null }, 200, { "Cache-Control": "no-store" });
-});
-
-app.get("/api/__phase2/probe/capabilities", async (c) => {
-  const auth = await authenticateProbeRequest(c.req.raw, c.env);
-  const client = await getPhase2ProbeOAuthClient(c.env);
-  const oauthSession = await client.restore(auth.did);
-  const token = await oauthSession.getTokenInfo(false);
-  const results = await probeAppviewCapabilities(oauthSession);
-  return c.json({ did: auth.did, scope: token.scope, results }, 200, { "Cache-Control": "no-store" });
-});
-
-app.post("/api/__phase2/probe/dm", async (c) => {
-  const auth = await authenticateProbeRequest(c.req.raw, c.env);
-  requireProbeCsrf(c.req.raw, c.env);
-  const phase = c.req.query("phase");
-  const senderDid = c.req.query("sender");
-  const recipientDid = c.req.query("recipient");
-  if (!phase || !["accepted", "none", "block"].includes(phase)) {
-    throw new NetslumError("INVALID_INPUT", "phase query parameter (accepted|none|block) is required", 400);
-  }
-  if (!senderDid?.startsWith("did:") || !recipientDid?.startsWith("did:")) {
-    throw new NetslumError("INVALID_INPUT", "sender and recipient DID query parameters are required", 400);
-  }
-  if (auth.did !== senderDid && auth.did !== recipientDid) {
-    throw new NetslumError("INVALID_INPUT", "the driving web session must be one of sender or recipient", 400);
-  }
-  const client = await getPhase2ProbeOAuthClient(c.env);
-  const senderSession = await client.restore(senderDid);
-  const recipientSession = await client.restore(recipientDid);
-  let steps: Awaited<ReturnType<typeof probeDmLifecycle>>;
-  if (phase === "accepted") {
-    steps = await probeDmLifecycle(senderSession, recipientSession, senderDid, recipientDid);
-  } else if (phase === "none") {
-    steps = await probeDmNoneDenial(senderSession, recipientSession, senderDid, recipientDid);
-  } else {
-    steps = await probeDmBlockBehavior(senderSession, recipientSession, senderDid, recipientDid);
-  }
-  return c.json({ did: auth.did, sender: senderDid, recipient: recipientDid, steps }, 200, { "Cache-Control": "no-store" });
-});
-
-app.post("/api/__phase2/probe/video/start", async (c) => {
-  const auth = await authenticateProbeRequest(c.req.raw, c.env);
-  requireProbeCsrf(c.req.raw, c.env);
-  const sizeBytes = Number(c.req.query("sizeBytes"));
-  if (!Number.isInteger(sizeBytes) || sizeBytes < 1 || sizeBytes > 100 * 1024 * 1024) {
-    throw new NetslumError("INVALID_INPUT", "sizeBytes query parameter is required", 400);
-  }
-  const client = await getPhase2ProbeOAuthClient(c.env);
-  const oauthSession = await client.restore(auth.did);
-  const agent = new Agent(oauthSession as never);
-  const getSessionServiceAuth = async (aud: string, lxm: string): Promise<string> => {
-    const response = await agent.com.atproto.server.getServiceAuth({ aud, lxm, exp: Math.floor(Date.now() / 1000) + 1800 });
-    return response.data.token;
-  };
-  // Empirical: getUploadLimits wants aud=video service + its own lxm, while
-  // startUpload wants aud=the actor's PDS + uploadBlob lxm. Resolve the PDS
-  // DID for the second token.
-  const didDocUrl = auth.did.startsWith("did:plc:")
-    ? `https://plc.directory/${encodeURIComponent(auth.did)}`
-    : `https://${auth.did.slice(8).split(":")[0]}/.well-known/did.json`;
-  const didDocResponse = await fetch(didDocUrl, { signal: AbortSignal.timeout(10_000) });
-  if (!didDocResponse.ok) {
-    throw new NetslumError("UPSTREAM_UNAVAILABLE", `DID document request failed (${didDocResponse.status})`, 502);
-  }
-  const didDocParsed = z.object({ service: z.array(z.record(z.string(), z.unknown())).optional() }).safeParse(await didDocResponse.json());
-  if (!didDocParsed.success) {
-    throw new NetslumError("UPSTREAM_UNAVAILABLE", "DID document is not valid JSON with a service array", 502);
-  }
-  const pdsService = didDocParsed.data.service?.find((s) => typeof s === "object" && s !== null && typeof (s as { id?: unknown }).id === "string" && ((s as { id?: unknown }).id as string).endsWith("#atproto_pds")) as { serviceEndpoint?: unknown } | undefined;
-  const pdsEndpoint = typeof pdsService?.serviceEndpoint === "string" ? pdsService.serviceEndpoint : null;
-  if (!pdsEndpoint) throw new NetslumError("UPSTREAM_UNAVAILABLE", "PDS endpoint not found in DID document", 502);
-  const pdsDid = `did:web:${new URL(pdsEndpoint).hostname}`;
-  const start = await probeVideoStart(oauthSession, getSessionServiceAuth, VIDEO_SERVICE_AUDIENCE, pdsDid, sizeBytes);
-  return c.json({ did: auth.did, serviceAudience: VIDEO_SERVICE_AUDIENCE, pdsDid, ...start }, 200, { "Cache-Control": "no-store" });
-});
-
-app.post("/api/__phase2/probe/video/publish", async (c) => {
-  const auth = await authenticateProbeRequest(c.req.raw, c.env);
-  requireProbeCsrf(c.req.raw, c.env);
-  const blobRef = await c.req.json<Record<string, unknown>>().catch(() => null);
-  if (!blobRef || typeof blobRef.$type !== "string" || blobRef.$type !== "blob") {
-    throw new NetslumError("INVALID_INPUT", "a completed blob ref is required", 400);
-  }
-  const blobLink = (blobRef.ref as { $link?: unknown } | undefined)?.$link;
-  if (typeof blobLink !== "string" || blobLink.length === 0) {
-    throw new NetslumError("INVALID_INPUT", "blob ref must contain a nonempty $link", 400);
-  }
-  const client = await getPhase2ProbeOAuthClient(c.env);
-  const oauthSession = await client.restore(auth.did);
-  const steps = await probeVideoPublish(c.env, oauthSession, auth.did, blobRef);
-  return c.json({ did: auth.did, steps }, 200, { "Cache-Control": "no-store" });
-});
-
-app.post("/api/__phase2/probe/logout", async (c) => {
-  const auth = await authenticateProbeRequest(c.req.raw, c.env);
-  requireProbeCsrf(c.req.raw, c.env);
-  const client = await getPhase2ProbeOAuthClient(c.env);
-  await client.revoke(auth.did).catch(() => undefined);
-  await c.env.DB.prepare("DELETE FROM oauth_probe_session WHERE did=?").bind(auth.did).run();
-  const headers = await logoutProbe(c.req.raw, c.env);
-  return c.json({ ok: true }, 200, { "Set-Cookie": headers.getSetCookie()[0] ?? "", "Cache-Control": "no-store" });
-});
-
 // OAuth Callback
 app.get("/oauth/callback", async (c) => {
-  const client = await getOAuthClient(c.env);
-  const params = new URLSearchParams(new URL(c.req.url).search);
-  const { session } = await client.callback(params);
-  const token = await session.getTokenInfo(false);
-  const { headers } = await issueWebSession(c.env, session.did, {
-    grantedScope: token.scope,
-    scopeVersion: OAUTH_SCOPE_VERSION
-  });
-  headers.set("Location", "/town");
-  return new Response(null, { status: 302, headers });
+  try {
+    const client = await getOAuthClient(c.env);
+    const params = new URLSearchParams(new URL(c.req.url).search);
+    const { session } = await client.callback(params);
+    const token = await session.getTokenInfo(false);
+    const { headers } = await issueWebSession(c.env, session.did, {
+      grantedScope: token.scope,
+      scopeVersion: OAUTH_SCOPE_VERSION
+    });
+    headers.set("Location", "/");
+    return new Response(null, { status: 302, headers });
+  } catch (error) {
+    console.error("OAuth callback failure:", error);
+    return c.redirect("/?error=auth_failed", 302);
+  }
 });
 
 // Session & Logout
 app.get("/api/session", async (c) => {
+  let auth: AuthenticatedSession;
   try {
-    const auth = await authenticateRequest(c.req.raw, c.env, false);
+    auth = await authenticateRequest(c.req.raw, c.env, false, false);
+  } catch {
+    return c.json({ authenticated: false, canPublishSite: false, reauthorizeRequired: false });
+  }
+
+  let handle = auth.did;
+  let allowed = false;
+
+  try {
     const client = await getOAuthClient(c.env);
     await client.restore(auth.did).catch(() => undefined);
-    const allowed = await canPublishSite(auth.did, c.env).catch(() => false);
-    let handle = auth.did;
+  } catch {
+    // Client restore is non-fatal for session identity
+  }
+
+  try {
+    allowed = await canPublishSite(auth.did, c.env).catch(() => false);
+  } catch {
+    allowed = false;
+  }
+
+  try {
     if (auth.did.startsWith("did:plc:")) {
-      const plc = await fetch(`https://plc.directory/${encodeURIComponent(auth.did)}`, { signal: AbortSignal.timeout(4000) })
-        .then((r) => (r.ok ? r.json() : null) as Promise<{ alsoKnownAs?: string[] } | null>)
-        .catch(() => null);
+      const plc = await resolveDidDocument(auth.did).catch(() => null);
       const atHandle = plc?.alsoKnownAs?.find((id) => id.startsWith("at://"));
       if (atHandle) handle = atHandle.slice("at://".length);
     } else if (auth.did.startsWith("did:web:")) {
       handle = decodeURIComponent(auth.did.split(":")[2] ?? auth.did).split(".")[0] ?? handle;
     }
-    // Phase 2: capabilities derive from the granted token (plan §A1). A
-    // session whose grant does not contain the current required scope set
-    // reports reauthorizeRequired; protected routes return
-    // REAUTHORIZE_REQUIRED instead of an opaque upstream 403.
-    const { reauthorizeRequired } = sessionCapabilities(auth.grantedScope, auth.scopeVersion, auth.dmAgentEnabled);
-    return c.json({
-      authenticated: true,
-      did: auth.did,
-      handle,
-      displayHandle: presentHandle(handle),
-      canPublishSite: allowed,
-      reauthorizeRequired,
-      dmAgentEnabled: auth.dmAgentEnabled,
-      scopeVersion: auth.scopeVersion
-    });
   } catch {
-    return c.json({ authenticated: false, canPublishSite: false, reauthorizeRequired: false });
+    handle = auth.did;
   }
+
+  const capabilities = sessionCapabilities(auth.grantedScope, auth.scopeVersion, auth.dmAgentEnabled);
+  return c.json({
+    authenticated: true,
+    did: auth.did,
+    handle,
+    displayHandle: presentHandle(handle),
+    canPublishSite: allowed,
+    canAuthorHome: allowed,
+    reauthorizeRequired: capabilities.reauthorizeRequired,
+    dmAgentEnabled: capabilities.dmAgentEnabled,
+    canUseDms: capabilities.canUseDms,
+    canUploadVideo: capabilities.canUploadVideo,
+    scopeVersion: auth.scopeVersion
+  });
 });
 
 app.post("/api/auth/logout", async (c) => {
@@ -333,8 +221,9 @@ app.get("/api/feed", async (c) => {
 
 app.get("/api/profile/:actor", async (c) => {
   const actor = decodeURIComponent(c.req.param("actor"));
+  const auth = await authenticateRequest(c.req.raw, c.env, false).catch(() => null);
   const service = new AtprotoService(c.env);
-  const profile = await service.getProfile(actor);
+  const profile = await service.getProfile(actor, auth?.did);
   const site = await c.env.DB.prepare(
     "SELECT slug, active_revision FROM site WHERE did = ? AND status = 'active' AND active_revision IS NOT NULL"
   ).bind(profile.did).first<{ slug: string }>();
@@ -480,6 +369,18 @@ app.delete("/api/feeds/saved", async (c) => {
   const service = new AtprotoService(c.env);
   return c.json(await service.unsetSavedFeed(auth.did, uri));
 });
+app.post("/api/media/image/upload", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const draftIdParam = c.req.query("draftId") ?? c.req.header("X-Draft-Id");
+  if (!draftIdParam) {
+    throw new NetslumError("INVALID_INPUT", "draftId query parameter or X-Draft-Id header is required", 400);
+  }
+  const draftId = z.string().max(64).parse(draftIdParam);
+  const bytes = new Uint8Array(await c.req.arrayBuffer());
+  const service = new MediaService(c.env);
+  return c.json(await service.uploadImage(auth.did, draftId, bytes));
+});
+
 app.post("/api/media/image/:draftId", async (c) => {
   const auth = await authenticateRequest(c.req.raw, c.env, true);
   const draftId = z.string().max(64).parse(c.req.param("draftId"));
@@ -493,6 +394,68 @@ app.post("/api/media/video/prepare", async (c) => {
   const input = prepareVideoSchema.parse(await c.req.json());
   const service = new MediaService(c.env);
   return c.json(await service.prepareVideo(auth.did, input));
+});
+
+app.post("/api/media/video/chunk", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const draftIdParam = c.req.query("draftId") ?? c.req.header("X-Draft-Id");
+  if (!draftIdParam) {
+    throw new NetslumError("INVALID_INPUT", "draftId query parameter or X-Draft-Id header is required", 400);
+  }
+  const draftId = z.string().max(64).parse(draftIdParam);
+  const partNumberParam = c.req.query("partNumber") ?? c.req.header("X-Part-Number");
+  const partNumber = partNumberParam ? parseInt(partNumberParam, 10) : 1;
+  const totalPartsParam = c.req.query("totalParts") ?? c.req.header("X-Total-Parts");
+  const totalParts = totalPartsParam ? parseInt(totalPartsParam, 10) : undefined;
+  const bytes = new Uint8Array(await c.req.arrayBuffer());
+  const service = new MediaService(c.env);
+  return c.json(await service.uploadVideoChunk(auth.did, draftId, bytes, partNumber, totalParts));
+});
+
+app.post("/api/media/video/complete", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  let draftId: string | undefined;
+  let jobId: string | undefined;
+
+  const contentType = c.req.header("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    const body: unknown = await c.req.json().catch(() => ({}));
+    const parsed = z.object({
+      draftId: z.string().max(64),
+      jobId: z.string().max(128).optional()
+    }).safeParse(body);
+    if (parsed.success) {
+      draftId = parsed.data.draftId;
+      jobId = parsed.data.jobId;
+    }
+  }
+
+  if (!draftId) {
+    const draftIdQuery = c.req.query("draftId") ?? c.req.header("X-Draft-Id");
+    if (draftIdQuery) draftId = z.string().max(64).parse(draftIdQuery);
+  }
+  if (!jobId) {
+    const jobIdQuery = c.req.query("jobId") ?? c.req.header("X-Job-Id");
+    if (jobIdQuery) jobId = z.string().max(128).parse(jobIdQuery);
+  }
+
+  if (!draftId) {
+    throw new NetslumError("INVALID_INPUT", "draftId is required", 400);
+  }
+
+  const service = new MediaService(c.env);
+  return c.json(await service.completeVideo(auth.did, draftId, jobId));
+});
+
+app.get("/api/media/video/status", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const jobIdParam = c.req.query("jobId") ?? c.req.header("X-Job-Id");
+  if (!jobIdParam) {
+    throw new NetslumError("INVALID_INPUT", "jobId query parameter is required", 400);
+  }
+  const jobId = z.string().max(128).parse(jobIdParam);
+  const service = new MediaService(c.env);
+  return c.json(await service.getJobStatus(auth.did, jobId), 200, { "Cache-Control": "no-store" });
 });
 
 // Direct messages (plan §D). All reads/writes proxy to Bluesky Chat with the
@@ -545,12 +508,34 @@ app.put("/api/profile", async (c) => {
   }));
 });
 
+app.post("/api/profile/avatar", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const contentType = c.req.header("content-type") ?? "image/jpeg";
+  if (!contentType.startsWith("image/")) return c.json({ error: "Must be an image" }, 400);
+  const bytes = await c.req.arrayBuffer();
+  if (bytes.byteLength > 1_000_000) return c.json({ error: "Image too large (max 1MB)" }, 400);
+  const service = new AtprotoService(c.env);
+  const blobRef = await service.uploadBlobForDid(auth.did, new Uint8Array(bytes), contentType);
+  await service.updateOwnProfile(auth.did, { avatarRef: blobRef });
+  return c.json({ ok: true }, 200);
+});
+
 app.get("/api/dms/conversation", async (c) => {
   const auth = await authenticateRequest(c.req.raw, c.env, false);
   const members = z.array(z.string().max(315)).min(1).max(2).parse((c.req.query("members") ?? "").split(",").filter(Boolean));
   const service = new ChatService(c.env);
   return c.json(await service.getConvoForMembers(auth.did, members), 200, { "Cache-Control": "no-store" });
 });
+app.post("/api/dms/start", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({ recipient: z.string().min(1).max(315) }).strict().parse(await c.req.json());
+  const graph = new GraphService(c.env);
+  const resolved = await graph.resolveActor(input.recipient);
+  const chat = new ChatService(c.env);
+  const convo = await chat.getConvoForMembers(auth.did, [resolved.did]);
+  return c.json({ convo, recipientDid: resolved.did, handle: resolved.handle });
+});
+
 
 app.get("/api/dms/messages", async (c) => {
   const auth = await authenticateRequest(c.req.raw, c.env, false);
@@ -563,12 +548,21 @@ app.get("/api/dms/messages", async (c) => {
 app.post("/api/dms/prepare", async (c) => {
   const auth = await authenticateRequest(c.req.raw, c.env, true);
   const input = z.object({
-    convoId: z.string().max(64),
+    convoId: z.string().max(64).optional(),
     recipientDids: z.array(z.string().max(315)).min(1).max(8),
     text: z.string().max(4000)
   }).strict().parse(await c.req.json());
+  let convoId = input.convoId;
+  if (!convoId) {
+    const chat = new ChatService(c.env);
+    // The chat service treats the authenticated requester as an implicit member,
+    // so pass only recipients; recipient-policy failures (muted, following-only,
+    // disabled) must surface instead of producing an unsendable draft.
+    const convo = await chat.getConvoForMembers(auth.did, input.recipientDids);
+    convoId = typeof convo.id === "string" ? convo.id : "";
+  }
   const service = new DmDraftService(c.env);
-  return c.json(await service.prepare(auth.did, input), 200, { "Cache-Control": "no-store" });
+  return c.json(await service.prepare(auth.did, { convoId: convoId ?? "", recipientDids: input.recipientDids, text: input.text }), 200, { "Cache-Control": "no-store" });
 });
 
 app.post("/api/dms/send", async (c) => {
@@ -608,6 +602,13 @@ app.post("/api/dms/delete-for-self", async (c) => {
   return c.json(await service.deleteMessageForSelf(auth.did, input.convoId, input.messageId));
 });
 
+app.post("/api/dms/delete", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({ convoId: z.string().max(64), messageId: z.string().max(64) }).strict().parse(await c.req.json());
+  const service = new ChatService(c.env);
+  return c.json(await service.deleteMessageForSelf(auth.did, input.convoId, input.messageId));
+});
+
 app.post("/api/dms/accept", async (c) => {
   const auth = await authenticateRequest(c.req.raw, c.env, true);
   const input = z.object({ convoId: z.string().max(64) }).strict().parse(await c.req.json());
@@ -626,9 +627,24 @@ app.post("/api/dms/mute", async (c) => {
 app.put("/api/settings/dm-agent", async (c) => {
   const auth = await authenticateRequest(c.req.raw, c.env, true);
   const input = z.object({ enabled: z.boolean() }).strict().parse(await c.req.json());
-  await c.env.DB.prepare("UPDATE web_session SET dm_agent_enabled=? WHERE id_hash IN (SELECT id_hash FROM web_session WHERE did=?)")
-    .bind(input.enabled ? 1 : 0, auth.did).run();
+  await c.env.DB.prepare("UPDATE web_session SET dm_agent_enabled=? WHERE id_hash=?")
+    .bind(input.enabled ? 1 : 0, auth.sessionIdHash).run();
   return c.json({ dmAgentEnabled: input.enabled });
+});
+
+app.get("/api/settings/chat-declaration", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const service = new ChatService(c.env);
+  return c.json(await service.ensureDeclaration(auth.did));
+});
+
+app.put("/api/settings/chat-declaration", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const input = z.object({
+    allowIncoming: z.enum(["all", "following", "none"])
+  }).strict().parse(await c.req.json());
+  const service = new ChatService(c.env);
+  return c.json(await service.updateDeclaration(auth.did, input.allowIncoming));
 });
 
 app.delete("/api/posts/:uri", async (c) => {
@@ -662,6 +678,33 @@ app.get("/api/search/posts", async (c) => {
   return c.json(result, 200, { "Cache-Control": "no-store" });
 });
 
+app.get("/api/search/actors", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false).catch(() => null);
+  const q = z.string().min(1).max(64).parse(c.req.query("q"));
+  const limit = z.coerce.number().int().min(1).max(25).default(25).parse(c.req.query("limit") ?? undefined);
+  const service = new GraphService(c.env);
+  const result = await service.searchActors(auth?.did, q, limit, c.req.query("cursor") ?? undefined);
+  return c.json(result, 200, { "Cache-Control": "no-store" });
+});
+
+app.get("/api/search/feeds", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false).catch(() => null);
+  const q = z.string().min(1).max(64).parse(c.req.query("q"));
+  const limit = z.coerce.number().int().min(1).max(25).default(25).parse(c.req.query("limit") ?? undefined);
+  const service = new AtprotoService(c.env);
+  const result = await service.searchFeeds(auth?.did, q, c.req.query("cursor") ?? undefined, limit);
+  return c.json(result, 200, { "Cache-Control": "no-store" });
+});
+
+app.get("/api/feed/custom", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false).catch(() => null);
+  const feed = z.string().min(1).max(2048).parse(c.req.query("feed") ?? c.req.query("feedUri"));
+  const limit = z.coerce.number().int().min(1).max(50).default(25).parse(c.req.query("limit") ?? undefined);
+  const service = new AtprotoService(c.env);
+  const result = await service.getCustomFeed(auth?.did, feed, c.req.query("cursor") ?? undefined, limit);
+  return c.json(result, 200, { "Cache-Control": "no-store" });
+});
+
 
 // Zone routes (delegating to ZoneRoom Durable Object)
 app.get("/api/zones/:zoneKey", async (c) => {
@@ -682,7 +725,19 @@ app.post("/api/zones/:zoneKey/mutations", async (c) => {
   const auth = await authenticateRequest(c.req.raw, c.env, true);
   const zoneKey = parseZoneKey(c.req.param("zoneKey"));
   const body: unknown = await c.req.json();
-  zoneMutationSchema.parse(body); // validate schema
+  const parsed = zoneMutationSchema.parse(body); // validate schema
+
+  for (const operation of parsed.operations) {
+    if (operation.op === "place") {
+      const obj = operation.object;
+      if (obj.type === "portal" && obj.experience?.siteSlug) {
+        const site = await c.env.DB.prepare("SELECT did FROM site WHERE slug=? AND status='active'").bind(obj.experience.siteSlug).first<{ did: string }>();
+        if (!site || site.did !== auth.did) {
+          throw new NetslumError("FORBIDDEN", "You can only link portals to your own published sites", 403);
+        }
+      }
+    }
+  }
 
   const id = c.env.ZONES.idFromName(zoneKey);
   const room = c.env.ZONES.get(id);
@@ -734,6 +789,24 @@ app.delete("/api/sites/file", async (c) => {
   return c.json(result);
 });
 
+app.post("/api/sites/preview-session", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const body = await c.req.json<{ revision?: string }>().catch(() => ({} as { revision?: string }));
+  const service = new SiteService(c.env);
+  const draft = await service.getDraft(auth.did);
+  const revision = body.revision ?? draft.revision;
+  const siteId = `site-${(await sha256Hex(auth.did)).slice(0, 24)}`;
+  const token = await randomToken();
+  const tokenHash = await hashToken(token);
+  const now = Date.now();
+  await c.env.DB.prepare(
+    "INSERT INTO preview_capability(capability_hash, did, revision, created_at, expires_at) VALUES(?,?,?,?,?)"
+  ).bind(tokenHash, auth.did, revision, now, now + 10 * 60_000).run();
+
+  const previewUrl = `https://preview-${siteId}.sites.netslum.macha.sh/?cap=${token}`;
+  return c.json({ previewUrl, token, revision, expiresAt: now + 10 * 60_000 });
+});
+
 app.post("/api/sites/publish", async (c) => {
   const auth = await authenticateRequest(c.req.raw, c.env, true);
   const body: unknown = await c.req.json();
@@ -766,11 +839,62 @@ app.put("/api/home/settings", async (c) => {
   return c.json(await service.get(auth.did));
 });
 
+app.get("/api/home/schema", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false).catch(() => null);
+  if (!auth) return c.json({ schema: null });
+  const service = new HomeSettingsService(c.env);
+  const settings = await service.get(auth.did).catch(() => ({ layoutSchema: null }));
+  return c.json({ schema: settings.layoutSchema });
+});
+
+app.put("/api/home/schema", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const service = new HomeSettingsService(c.env);
+  await service.requireLocalPds(auth.did);
+  const body = await c.req.json<{ schema?: Record<string, unknown> | null }>();
+  if (body.schema && JSON.stringify(body.schema).length > 65536) {
+    throw new NetslumError("INVALID_INPUT", "Home layout schema exceeds 64 KiB limit", 400);
+  }
+  await service.setLayoutSchema(auth.did, body.schema ?? null);
+  const settings = await service.get(auth.did);
+  return c.json({ ok: true, schema: settings.layoutSchema });
+});
+
+app.get("/api/sites/schema", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const service = new SiteService(c.env);
+  const fileName = c.req.query("file") || "personal_page.json";
+  const result = await service.getPageSchema(auth.did, fileName);
+  return c.json(result);
+});
+
+app.put("/api/sites/schema", async (c) => {
+  const auth = await authenticateRequest(c.req.raw, c.env, true);
+  const service = new SiteService(c.env);
+  const fileName = c.req.query("file") || "personal_page.json";
+  const body = await c.req.json<{ schema: Record<string, unknown> }>();
+  if (JSON.stringify(body.schema).length > 65536) {
+    throw new NetslumError("INVALID_INPUT", "Page schema exceeds 64 KiB limit", 400);
+  }
+  const result = await service.savePageSchema(auth.did, body.schema, undefined, fileName);
+  return c.json({ ok: true, revision: result.revision, schema: body.schema });
+});
+
+app.get("/api/sites/public-schema", async (c) => {
+  const slugOrActor = c.req.query("slug") || c.req.query("actor") || "";
+  if (!slugOrActor) throw new NetslumError("INVALID_INPUT", "Missing slug or actor parameter", 400);
+  const fileName = c.req.query("file") || "personal_page.json";
+  const service = new SiteService(c.env);
+  const result = await service.getPublicPageSchema(slugOrActor, fileName);
+  return c.json(result);
+});
+
 // Authored home (plan §E2): local-PDS users in authored mode mount their
 // active site's home.html from the TENANT origin (never same-origin srcdoc).
 // Missing/unpublished/suspended home content falls back to standard home.
 app.get("/api/home/mount", async (c) => {
-  const auth = await authenticateRequest(c.req.raw, c.env, false);
+  const auth = await authenticateRequest(c.req.raw, c.env, false).catch(() => null);
+  if (!auth) return c.json({ mode: "standard" });
   const settings = new HomeSettingsService(c.env);
   const local = await canPublishSite(auth.did, c.env).catch(() => false);
   if (!local) return c.json({ mode: "standard" });
@@ -782,12 +906,16 @@ app.get("/api/home/mount", async (c) => {
   // Fail closed: suspended/missing/failed home content never bricks navigation.
   if (!site || site.status !== "active" || !site.active_revision) return c.json({ mode: "standard" });
   const siteId = `site-${(await sha256Hex(auth.did)).slice(0, 24)}`;
-  const homeObject = await c.env.SITE_FILES.get(`release/${siteId}/${site.active_revision}/home.html`).catch(() => null);
-  if (!homeObject) return c.json({ mode: "standard" });
+  const [indexObj, homeObj] = await Promise.all([
+    c.env.SITE_FILES.get(`release/${siteId}/${site.active_revision}/index.html`).catch(() => null),
+    c.env.SITE_FILES.get(`release/${siteId}/${site.active_revision}/home.html`).catch(() => null)
+  ]);
+  const targetPath = indexObj ? "/index.html" : homeObj ? "/home.html" : null;
+  if (!targetPath) return c.json({ mode: "standard" });
   return c.json({
     mode: "authored",
     tenantOrigin: `https://${site.slug}.sites.netslum.macha.sh`,
-    path: "/home.html",
+    path: targetPath,
     title: `@${site.slug}`,
     revision: site.active_revision
   }, 200, { "Cache-Control": "no-store" });
@@ -892,18 +1020,26 @@ app.post("/api/__webmcp/:slug/:tool", async (c) => {
   // Execution flows through the site's isolated runtime dispatch binding
   // with the same CPU/subrequest/egress limits as _worker.js requests
   // (plan §F2). No Netslum credentials are forwarded.
-  const dispatcher = c.env.STAGING_DISPATCHER ?? undefined;
-  if (!dispatcher) throw new NetslumError("SERVERLESS_UNAVAILABLE", "Tenant runtime unavailable", 503);
-  const worker = dispatcher.get(site.active_worker, {}, { limits: { cpuMs: 50, subRequests: 5 } });
   const runtimeUrl = `https://runtime.internal/${siteId}/api/__webmcp/${encodeURIComponent(toolName)}`;
   const runtimeRequest = new Request(runtimeUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Netslum-Site-Id": siteId },
-    body: JSON.stringify({ input: payload.input ?? {} })
+    body: JSON.stringify({ input: payload.input ?? {} }),
+    signal: AbortSignal.timeout(10000)
   });
-  const runtimeResponse = await worker.fetch(runtimeRequest).catch(() => {
-    throw new NetslumError("TOOL_RUNTIME_FAILED", "Tenant tool execution failed", 502);
-  });
+  let runtimeResponse: Response;
+  if (c.env.SITE_RUNTIME) {
+    runtimeResponse = await c.env.SITE_RUNTIME.fetch(runtimeRequest).catch(() => {
+      throw new NetslumError("TOOL_RUNTIME_FAILED", "Tenant tool execution failed", 502);
+    });
+  } else if (c.env.STAGING_DISPATCHER) {
+    const worker = c.env.STAGING_DISPATCHER.get(site.active_worker, {}, { limits: { cpuMs: 50, subRequests: 5 } });
+    runtimeResponse = await worker.fetch(runtimeRequest).catch(() => {
+      throw new NetslumError("TOOL_RUNTIME_FAILED", "Tenant tool execution failed", 502);
+    });
+  } else {
+    throw new NetslumError("SERVERLESS_UNAVAILABLE", "Tenant runtime unavailable", 503);
+  }
   const bodyBytes = await runtimeResponse.arrayBuffer();
   if (bodyBytes.byteLength > 4096) throw new NetslumError("TOOL_RUNTIME_FAILED", "Tenant tool result exceeds 4 KiB", 502);
   const headers = new Headers({ "Content-Type": "application/json", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
@@ -968,27 +1104,18 @@ app.post("/api/admin/sites/restore", async (c) => {
 });
 
 // Public personal site vanity route: /@<slug>
+// Serves the user's published site via the tenant origin (slug.sites.netslum.macha.sh)
+// instead of srcdoc, so allow-same-origin is safe (isolated origin) and nested
+// iframes (YouTube, etc.) work correctly.
 app.get("/:vanity{@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$}", async (c) => {
   const rawSlug = c.req.param("vanity").slice(1);
   if (!slugSchema.safeParse(rawSlug).success) return c.text("Not found", 404);
 
-  const site = await c.env.DB.prepare("SELECT * FROM site WHERE slug = ? AND status = 'active'").bind(rawSlug).first<{
-    did: string;
+  const site = await c.env.DB.prepare("SELECT slug, active_revision, status FROM site WHERE slug = ? AND status = 'active'").bind(rawSlug).first<{
     slug: string;
     active_revision: string | null;
-    active_worker: string | null;
   }>();
   if (!site || !site.active_revision) return c.text("Site not found or inactive", 404);
-
-  const siteId = `site-${(await sha256Hex(site.did)).slice(0, 24)}`;
-  const indexObj = await c.env.SITE_FILES.get(`release/${siteId}/${site.active_revision}/index.html`);
-  if (!indexObj) return c.text("Site entry not found", 404);
-
-  const rawHtml = await indexObj.text();
-  const baseUrl = `${c.env.SITE_ASSET_ORIGIN}/release/${siteId}/${site.active_revision}/`;
-  const apiBase = site.active_worker ? `${c.env.SITE_RUNTIME_ORIGIN}/${siteId}/api` : null;
-  const rewritten = rewriteSiteHtml(rawHtml, { baseUrl, siteId, revision: site.active_revision, apiBase });
-  const escapedSrcDoc = rewritten.replaceAll("&", "&amp;").replaceAll('"', "&quot;");
 
   const shellHtml = `<!doctype html>
 <html lang="en">
@@ -1002,7 +1129,7 @@ app.get("/:vanity{@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$}", async (c) => {
     header { height: 44px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; border-bottom: 1px solid #2A3652; background: #101522; z-index: 10; }
     .brand { color: #57E6FF; font-weight: bold; text-decoration: none; font-size: 14px; }
     .site-info { color: #8792AA; font-size: 13px; }
-    iframe { flex: 1; border: none; width: 100%; height: calc(100vh - 44px); background: #ffffff; }
+    iframe { flex: 1; border: none; width: 100%; height: calc(100vh - 44px); background: #070910; }
   </style>
 </head>
 <body>
@@ -1011,7 +1138,7 @@ app.get("/:vanity{@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$}", async (c) => {
     <span class="site-info">@${site.slug} (rev: ${site.active_revision.slice(0, 8)})</span>
     <a href="/town" style="color:#57E6FF;text-decoration:none;font-size:13px;">town square &rarr;</a>
   </header>
-  <iframe sandbox="allow-scripts" srcdoc="${escapedSrcDoc}"></iframe>
+  <iframe sandbox="allow-scripts allow-same-origin" src="https://${site.slug}.sites.netslum.macha.sh/index.html"></iframe>
 </body>
 </html>`;
   return c.html(shellHtml);
@@ -1050,7 +1177,7 @@ app.get("/district/:slug{[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?}", async (c) => {
     <span class="district-info">district: @${slug.data} // ${pathParam}</span>
     <a href="/gate" style="color:#57E6FF;text-decoration:none;font-size:13px;">exit district &rarr;</a>
   </header>
-  <iframe sandbox="allow-scripts allow-same-origin" allow="webgpu" src="https://${slug.data}.sites.netslum.macha.sh/${pathParam}"></iframe>
+  <iframe sandbox="allow-scripts allow-same-origin" allow="webgpu; tools" src="https://${slug.data}.sites.netslum.macha.sh/${pathParam}"></iframe>
 </body>
 </html>`;
   return c.html(shellHtml);
@@ -1064,6 +1191,8 @@ app.get("*", (c) => {
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#070910">
   <title>netslum</title>
+  <link rel="preconnect" href="https://public.api.bsky.app" crossorigin>
+  <link rel="preconnect" href="https://video.bsky.app" crossorigin>
   <link rel="stylesheet" href="/static/css/client.css">
 </head>
 <body style="margin:0;background:#070910">

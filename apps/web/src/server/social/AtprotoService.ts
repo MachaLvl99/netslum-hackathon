@@ -3,6 +3,9 @@ import {
   deterministicPostRkey,
   deterministicReactionRkey,
   NetslumError,
+  normalizeActorInput,
+  LOCAL_PDS_SUFFIX,
+  presentHandle,
   sha256Hex,
   type PostSummary
 } from "@netslum/contracts";
@@ -73,6 +76,34 @@ function didDocumentUrl(did: string): string | null {
 function graphemeLength(text: string): number {
   return [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)].length;
 }
+async function addLocalMentionFacets(agent: Agent, richText: RichText): Promise<void> {
+  const facets = richText.facets ?? [];
+  const encoder = new TextEncoder();
+  const matches = richText.text.matchAll(/(^|[^\p{L}\p{N}._@-])@([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?![a-z0-9.-])/giu);
+  for (const match of matches) {
+    const label = match[2];
+    if (!label || match.index === undefined) continue;
+    const atIndex = match.index + (match[1]?.length ?? 0);
+    const endIndex = atIndex + label.length + 1;
+    const byteStart = encoder.encode(richText.text.slice(0, atIndex)).byteLength;
+    const byteEnd = encoder.encode(richText.text.slice(0, endIndex)).byteLength;
+    if (facets.some((facet) => facet.index.byteStart < byteEnd && facet.index.byteEnd > byteStart)) continue;
+    try {
+      const resolved = await agent.resolveHandle(
+        { handle: `${label.toLowerCase()}${LOCAL_PDS_SUFFIX}` },
+        { signal: AbortSignal.timeout(5000) }
+      );
+      facets.push({
+        index: { byteStart, byteEnd },
+        features: [{ $type: "app.bsky.richtext.facet#mention", did: resolved.data.did }]
+      });
+    } catch {
+      // Unresolved shorthand remains plain visible text.
+    }
+  }
+  richText.facets = facets;
+}
+
 
 export class AtprotoService {
   constructor(private readonly env: CloudflareEnv) {}
@@ -267,18 +298,56 @@ export class AtprotoService {
   }
 
 
-  async getProfile(actor: string): Promise<{ did: string; handle: string; displayName?: string; description?: string }> {
-    const agent = await this.getAgent();
-    const response = await agent.getProfile({ actor }, { signal: AbortSignal.timeout(5000) }).catch(() => {
+  async getProfile(actor: string, viewerDid?: string): Promise<{
+    did: string;
+    handle: string;
+    displayHandle: string;
+    displayName?: string;
+    description?: string;
+    avatar?: string;
+    banner?: string;
+    followersCount?: number;
+    followsCount?: number;
+    postsCount?: number;
+    labels: Array<Record<string, unknown>>;
+    viewer?: {
+      following: boolean;
+      followedBy: boolean;
+      muted: boolean;
+      blocked: boolean;
+      blocking: boolean;
+    };
+  }> {
+    const agent = viewerDid ? await this.proxiedAgent(viewerDid) : await this.getAgent();
+    const response = await agent.getProfile(
+      { actor: normalizeActorInput(actor) },
+      { signal: AbortSignal.timeout(5000) }
+    ).catch(() => {
       throw new NetslumError("NOT_FOUND", "Profile not found", 404);
     });
-    const profile: { did: string; handle: string; displayName?: string; description?: string } = {
-      did: response.data.did,
-      handle: response.data.handle
+    const data = response.data;
+    return {
+      did: data.did,
+      handle: data.handle,
+      displayHandle: presentHandle(data.handle),
+      ...(data.displayName ? { displayName: data.displayName } : {}),
+      ...(data.description ? { description: data.description } : {}),
+      ...(data.avatar ? { avatar: data.avatar } : {}),
+      ...(data.banner ? { banner: data.banner } : {}),
+      ...(typeof data.followersCount === "number" ? { followersCount: data.followersCount } : {}),
+      ...(typeof data.followsCount === "number" ? { followsCount: data.followsCount } : {}),
+      ...(typeof data.postsCount === "number" ? { postsCount: data.postsCount } : {}),
+      labels: data.labels as unknown as Array<Record<string, unknown>>,
+      ...(data.viewer ? {
+        viewer: {
+          following: typeof data.viewer.following === "string",
+          followedBy: typeof data.viewer.followedBy === "string",
+          muted: data.viewer.muted === true,
+          blocked: data.viewer.blockedBy === true,
+          blocking: typeof data.viewer.blocking === "string"
+        }
+      } : {})
     };
-    if (response.data.displayName) profile.displayName = response.data.displayName;
-    if (response.data.description) profile.description = response.data.description;
-    return profile;
   }
 
   async preparePost(
@@ -385,6 +454,7 @@ export class AtprotoService {
     const richText = new RichText({ text: fullText, ...(draft.languages ? { langs: JSON.parse(draft.languages) as string[] } : {}) });
     await richText.detectFacets(agent);
     let reply: { root: { uri: string; cid: string }; parent: { uri: string; cid: string } } | undefined;
+    await addLocalMentionFacets(agent, richText);
     if (draft.reply_to_uri) {
       const match = /^at:\/\/([^/]+)\/app\.bsky\.feed\.post\/([^/]+)$/.exec(draft.reply_to_uri);
       if (!match) throw new NetslumError("INVALID_INPUT", "Invalid reply URI", 400);
@@ -407,24 +477,45 @@ export class AtprotoService {
     // Embeds (plan §C3/C4): quote embeds reference the quoted record; media
     // embeds come from the actor's completed encrypted media drafts.
     let embed: Record<string, unknown> | undefined;
-    const mediaRefs: Array<Record<string, unknown>> = [];
+    const mediaRefs: Array<{ kind?: string; blob?: Record<string, unknown>; image?: Record<string, unknown>; video?: Record<string, unknown>; alt?: string } & Record<string, unknown>> = [];
     if (draft.media_draft_ids) {
       const draftIds = JSON.parse(draft.media_draft_ids) as string[];
       for (const mediaDraftId of draftIds.slice(0, 4)) {
         try {
-          mediaRefs.push(await this.mediaBlobRef(actorDid, mediaDraftId));
+          const ref = await this.mediaBlobRef(actorDid, mediaDraftId);
+          mediaRefs.push(ref as { kind?: string; blob?: Record<string, unknown>; image?: Record<string, unknown>; video?: Record<string, unknown>; alt?: string } & Record<string, unknown>);
         } catch { /* a missing/expired draft attachment is skipped, not fatal */ }
       }
     }
+
+    const videoRef = mediaRefs.find((ref) => ref.kind === "video" || ref.video !== undefined);
+    let mediaEmbed: Record<string, unknown> | undefined;
+
+    if (videoRef) {
+      const videoBlob = videoRef.video ?? videoRef.blob ?? videoRef;
+      mediaEmbed = {
+        $type: "app.bsky.embed.video",
+        video: videoBlob,
+        ...(videoRef.alt ? { alt: videoRef.alt } : {})
+      };
+    } else if (mediaRefs.length > 0) {
+      const imageItems = mediaRefs.map((ref) => ({
+        image: ref.image ?? ref.blob ?? ref,
+        alt: (typeof ref.alt === "string" ? ref.alt : "")
+      }));
+      mediaEmbed = {
+        $type: "app.bsky.embed.images",
+        images: imageItems
+      };
+    }
+
     if (draft.quote_uri && draft.quote_cid) {
       const recordEmbed = { $type: "app.bsky.embed.record", record: { uri: draft.quote_uri, cid: draft.quote_cid } };
-      embed = mediaRefs.length === 1
-        ? { $type: "app.bsky.embed.record_with_media", record: recordEmbed, media: { $type: "app.bsky.embed.images", images: [mediaRefs[0]] } }
+      embed = mediaEmbed
+        ? { $type: "app.bsky.embed.recordWithMedia", record: recordEmbed, media: mediaEmbed }
         : recordEmbed;
-    } else if (mediaRefs.length === 1) {
-      embed = { $type: "app.bsky.embed.images", images: [mediaRefs[0]] };
-    } else if (mediaRefs.length > 1) {
-      embed = { $type: "app.bsky.embed.images", images: mediaRefs };
+    } else if (mediaEmbed) {
+      embed = mediaEmbed;
     }
 
     const publishedAt = new Date().toISOString();
@@ -456,7 +547,7 @@ export class AtprotoService {
   /** Resolves the completed blob ref for one of the actor's media drafts. */
   private async mediaBlobRef(actorDid: string, draftId: string): Promise<Record<string, unknown>> {
     const media = new MediaService(this.env);
-    return media.getBlob(actorDid, draftId);
+    return media.mediaBlobRef(actorDid, draftId) as unknown as Promise<Record<string, unknown>>;
   }
   async reactToPost(actorDid: string, input: { uri: string; cid: string; action: "like" | "unlike" | "repost" | "unrepost" }): Promise<{ action: string; uri: string; active: boolean }> {
     const isLike = input.action === "like" || input.action === "unlike";
@@ -562,8 +653,7 @@ export class AtprotoService {
       if (level <= 0 || !node || typeof node !== "object") return;
       const entry = node as { post?: unknown; replies?: unknown[] };
       if (entry.post && typeof entry.post === "object") {
-        const summary = this.toPostSummary(entry.post as never);
-        if (level < depth) replies.push(summary);
+        replies.push(this.toPostSummary(entry.post as never));
       }
       for (const child of entry.replies ?? []) walk(child, level - 1);
     };
@@ -604,12 +694,14 @@ export class AtprotoService {
 
   async markNotificationsSeen(actorDid: string, seenAt?: string): Promise<{ seenAt: string }> {
     const agent = await this.proxiedAgent(actorDid);
-    const response = await agent.app.bsky.notification.updateSeen({ seenAt: seenAt ?? new Date().toISOString() }, { signal: AbortSignal.timeout(8000) })
-      .catch(() => {
-        throw new NetslumError("UPSTREAM_UNAVAILABLE", "Mark seen failed", 502);
-      });
-    void response;
-    return { seenAt: seenAt ?? new Date().toISOString() };
+    const effectiveSeenAt = seenAt ?? new Date().toISOString();
+    await agent.app.bsky.notification.updateSeen(
+      { seenAt: effectiveSeenAt },
+      { signal: AbortSignal.timeout(8000) }
+    ).catch(() => {
+      throw new NetslumError("UPSTREAM_UNAVAILABLE", "Mark seen failed", 502);
+    });
+    return { seenAt: effectiveSeenAt };
   }
 
   async searchPosts(actorDid: string | undefined, query: string, cursor?: string, limit = 25): Promise<{ posts: PostSummary[]; cursor?: string }> {
@@ -620,6 +712,72 @@ export class AtprotoService {
       });
     return {
       posts: response.data.posts.map((post) => this.toPostSummary(post)),
+      ...(response.data.cursor ? { cursor: response.data.cursor } : {})
+    };
+  }
+
+  async searchFeeds(
+    actorDid: string | undefined,
+    query: string,
+    cursor?: string,
+    limit = 25
+  ): Promise<{
+    feeds: Array<{
+      uri: string;
+      cid: string;
+      displayName: string;
+      description?: string;
+      avatar?: string;
+      creator: { did: string; handle: string; displayName?: string };
+    }>;
+    cursor?: string;
+  }> {
+    const agent = actorDid ? await this.proxiedAgent(actorDid) : await this.getAgent();
+    const response = await agent.app.bsky.unspecced.getPopularFeedGenerators(
+      { query, limit, ...(cursor ? { cursor } : {}) },
+      { signal: AbortSignal.timeout(8000) }
+    ).catch(() => {
+      throw new NetslumError("UPSTREAM_UNAVAILABLE", "Feed search unavailable", 503, true);
+    });
+    return {
+      feeds: response.data.feeds.map((feed) => ({
+        uri: feed.uri,
+        cid: feed.cid,
+        displayName: feed.displayName,
+        ...(feed.description ? { description: feed.description } : {}),
+        ...(feed.avatar ? { avatar: feed.avatar } : {}),
+        creator: {
+          did: feed.creator.did,
+          handle: feed.creator.handle,
+          ...(feed.creator.displayName ? { displayName: feed.creator.displayName } : {})
+        }
+      })),
+      ...(response.data.cursor ? { cursor: response.data.cursor } : {})
+    };
+  }
+
+  async getCustomFeed(
+    actorDid: string | undefined,
+    feed: string,
+    cursor?: string,
+    limit = 25
+  ): Promise<{ posts: PostSummary[]; cursor?: string }> {
+    const params = { feed, limit, ...(cursor ? { cursor } : {}) };
+    const agent = actorDid ? await this.proxiedAgent(actorDid) : await this.getAgent();
+    const response = await agent.app.bsky.feed.getFeed(
+      params,
+      { signal: AbortSignal.timeout(8000) }
+    ).catch(async () => {
+      const publicAgent = await this.getAgent();
+      return publicAgent.app.bsky.feed.getFeed(
+        params,
+        { signal: AbortSignal.timeout(8000) }
+      ).catch(() => {
+        throw new NetslumError("UPSTREAM_UNAVAILABLE", "Custom feed unavailable", 503, true);
+      });
+    });
+    return {
+      posts: response.data.feed.map((entry) => this.toPostSummary(entry.post)),
       ...(response.data.cursor ? { cursor: response.data.cursor } : {})
     };
   }
@@ -717,6 +875,16 @@ export class AtprotoService {
 
   /** Profile edits (plan §C2): get-record then putRecord with swapCid so
    * unknown/new fields are preserved and concurrent edits fail visibly. */
+  /** Upload a blob (image/video) via the actor's PDS session and return the blob ref. */
+  async uploadBlobForDid(actorDid: string, bytes: Uint8Array, encoding: string): Promise<Record<string, unknown>> {
+    const agent = await this.getAgent(actorDid);
+    const response = await agent.com.atproto.repo.uploadBlob(bytes, { encoding }).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new NetslumError("UPSTREAM_UNAVAILABLE", `Blob upload failed: ${message.slice(0, 160)}`, 502);
+    });
+    return response.data.blob as unknown as Record<string, unknown>;
+  }
+
   async updateOwnProfile(actorDid: string, input: { displayName?: string | null; description?: string | null; avatarRef?: Record<string, unknown> | null; bannerRef?: Record<string, unknown> | null }): Promise<{ updated: true }> {
     const agent = await this.getAgent(actorDid);
     const existing = await agent.com.atproto.repo.getRecord({

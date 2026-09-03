@@ -1,79 +1,69 @@
-import type { LynxInputEvent, SiteFileInfo } from "./types.js";
-
-export const EDITOR_CHUNK_CHARS = 1000;
+import { Box, Card, Heading, Text, Badge, Button } from "../ui/index.js";
 
 export interface StudioViewProps {
   siteSlug: string;
-  siteRevision: string;
-  routeError: string | undefined;
-  siteFiles: SiteFileInfo[];
-  editorPath: string;
-  editorText: string;
-  setEditorText: (value: string) => void;
-  editorNextOffset: number;
-  loadMoreEditor: () => void;
-  openFile: (path: string) => void;
-  siteBusy: boolean;
-  saveFile: () => void;
-  publishSite: () => void;
-  sitePublishedUrl: string;
+  hasContent: boolean;
+  routeError?: string | undefined;
+  navigate?: ((route: string) => void) | undefined;
 }
 
 export function StudioView(props: StudioViewProps) {
-  const {
-    siteSlug,
-    siteRevision,
-    routeError,
-    siteFiles,
-    editorPath,
-    editorText,
-    setEditorText,
-    editorNextOffset,
-    loadMoreEditor,
-    openFile,
-    siteBusy,
-    saveFile,
-    publishSite,
-    sitePublishedUrl
-  } = props;
+  const { siteSlug, hasContent, routeError, navigate } = props;
+
   return (
-    <view className="content">
-      <text className="kicker">PERSONAL SITE STUDIO // @{siteSlug || "loading"}</text>
-      <text className="title">programmable page editor</text>
-      <text className="copy">Draft Revision: {siteRevision.slice(0, 16) || "none"}</text>
-      {routeError ? <text className="stale-label">{routeError}</text> : null}
+    <Box direction="column" gap="large" pad="large" width="100%">
+      <Card background="surface" border={{ color: "brand" }} elevation="glow" pad="large" gap="medium">
+        <Box direction="row" justify="between" align="center" wrap={true} gap="medium">
+          <Box direction="column" gap="xxsmall">
+            <Box direction="row" align="center" gap="small">
+              <Heading level={2} color="brand" mono>
+                STUDIO // @{siteSlug || "author"}
+              </Heading>
+              <Badge value={hasContent ? "SITE LIVE" : "STARTER DRAFT"} variant={hasContent ? "ok" : "warn"} />
+            </Box>
+            <Text size="small" color="textMuted" mono>
+              Personal Landing URL: https://{siteSlug || "you"}.sites.netslum.macha.sh/
+            </Text>
+          </Box>
 
-      <view className="studio-container">
-        <view className="file-tree">
-          <text className="tree-header">FILES ({siteFiles.length})</text>
-          {siteFiles.map(f => (
-            <view key={f.path} className={editorPath === f.path ? "file-item file-item-active" : "file-item"} bindtap={() => openFile(f.path)}>
-              <text className="file-item-text">&bull; {f.path}</text>
-              <text className="file-item-size">{f.size} B</text>
-            </view>
-          ))}
-        </view>
+          {navigate && (
+            <Box direction="row" gap="small">
+              <Button
+                label="VIEW LIVE DISTRICT"
+                variant="secondary"
+                size="small"
+                onClick={() => navigate(`/district/${siteSlug}`)}
+                bindtap={() => navigate(`/district/${siteSlug}`)}
+              />
+            </Box>
+          )}
+        </Box>
+      </Card>
 
-        <view className="editor-panel">
-          <text className="editor-label">EDITING {editorPath || "index.html"}</text>
-          <input
-            className="editor-input"
-            placeholder="<h1>Welcome to my Net Slum site</h1>"
-            value={editorText}
-            bindinput={(e: LynxInputEvent) => setEditorText(e.detail.value)}
-          />
-          {editorNextOffset ? (
-            <text className="stale-label" bindtap={loadMoreEditor}>FILE TRUNCATED // TAP TO LOAD NEXT {EDITOR_CHUNK_CHARS} CHARS</text>
-          ) : null}
-          <view className="editor-actions">
-            <text className={siteBusy ? "primary-sm busy" : "primary-sm"} bindtap={saveFile}>SAVE DRAFT</text>
-            <text className="secondary-sm" bindtap={publishSite}>PUBLISH SITE LIVE</text>
-          </view>
-          {sitePublishedUrl ? (
-            <text className="stale-label">PUBLISHED // {sitePublishedUrl}</text>
-          ) : null}
-        </view>
-      </view>
-    </view>
+      {routeError && (
+        <Card background="surface" border={{ color: "statusError" }} pad="medium">
+          <Text size="small" color="statusError" mono>
+            ⚠ {routeError}
+          </Text>
+        </Card>
+      )}
+
+      {!hasContent ? (
+        <Card background="surface" border={{ color: "borderSubtle" }} pad="xxlarge" align="center" gap="medium">
+          <Heading level={3} color="text" align="center" mono>
+            Ask your agent to make this page your home.
+          </Heading>
+          <Text size="medium" color="textMuted" align="center" style="max-width:520px;" mono>
+            Your AI agent or WebMCP companion can author TSX/HTML components, dynamic widgets, and WebGPU scenes directly into your index.tsx entrypoint.
+          </Text>
+        </Card>
+      ) : (
+        <Box align="center" justify="center" pad="large">
+          <Text size="small" color="textMuted" mono>
+            Rendering your published site…
+          </Text>
+        </Box>
+      )}
+    </Box>
   );
 }

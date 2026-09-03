@@ -8,6 +8,13 @@ describe("Chaos Gate contracts", () => {
     expect(() => parseZoneKey("hidden.archive.echo.extra")).toThrow();
   });
 
+  it("accepts the Paradise example zone keywords", () => {
+    // "hidden forbidden holy ground" — the .hack-style example zone.
+    expect(parseZoneKey("hidden.forbidden.holy_ground")).toBe("hidden.forbidden.holy_ground");
+    expect(() => parseZoneKey("forbidden.hidden.holy_ground")).toThrow();
+    expect(() => parseZoneKey("holy_ground.forbidden.hidden")).toThrow();
+  });
+
   it("derives stable deterministic scenes", async () => {
     await expect(zoneSeed("electric.cathedral.dawn")).resolves.toEqual(await zoneSeed("electric.cathedral.dawn"));
     await expect(zoneSeed("electric.cathedral.dawn")).resolves.not.toEqual(await zoneSeed("silent.garden.rain"));

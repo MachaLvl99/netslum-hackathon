@@ -5,7 +5,7 @@ const CHAT_AUDIENCE = "did:web:api.bsky.chat#bsky_chat";
 // the video service DID itself, not the account's PDS DID. The wildcard
 // uploadBlob scope below permits minting that token for this audience.
 export const VIDEO_SERVICE_AUDIENCE = "did:web:video.bsky.app";
-export const OAUTH_SCOPE_VERSION = 2;
+export const OAUTH_SCOPE_VERSION = 3;
 export const LEGACY_OAUTH_SCOPE = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete repo:sh.macha.netslumSite?action=create&action=update&action=delete blob:*/*";
 
 export const APPVIEW_METHODS = [
@@ -46,6 +46,7 @@ export const APPVIEW_METHODS = [
   "app.bsky.notification.listNotifications",
   "app.bsky.notification.putPreferencesV2",
   "app.bsky.notification.updateSeen",
+  "app.bsky.unspecced.getPopularFeedGenerators"
 ] as const;
 
 export const CHAT_METHODS = [
@@ -88,28 +89,34 @@ function rpcScope(method: string, audience: string): string {
 export const VIDEO_METHODS = [
   "app.bsky.video.abortUpload",
   "app.bsky.video.findVideoRepo",
+  "app.bsky.video.finishUpload",
   "app.bsky.video.getJobStatus",
   "app.bsky.video.getUploadLimits",
+  "app.bsky.video.getUploadStatus",
   "app.bsky.video.startUpload",
   "app.bsky.video.uploadPart"
 ] as const;
 
-export const PHASE2_OAUTH_SCOPE = [
+const PHASE2_REQUIRED_SCOPES = [
   "atproto",
   ...repositoryScopes,
   "blob:*/*",
-  // Blob uploads go through the account's PDS; the uploadBlob service-auth
-  // token is minted for downstream services (e.g. the video service).
   rpcScope("com.atproto.repo.uploadBlob", "*"),
-  // Reports may target the user's selected labeler, not necessarily Bluesky's
-  // AppView, so only the endpoint is fixed.
   rpcScope("com.atproto.moderation.createReport", "*"),
   ...APPVIEW_METHODS.map((method) => rpcScope(method, APPVIEW_AUDIENCE)),
-  ...VIDEO_METHODS.map((method) => rpcScope(method, VIDEO_SERVICE_AUDIENCE)),
   ...CHAT_METHODS.map((method) => rpcScope(method, CHAT_AUDIENCE))
+] as const;
+
+export const PHASE2_OAUTH_SCOPE = [
+  ...PHASE2_REQUIRED_SCOPES,
+  // Optional direct video-method grants. Bluesky currently drops these
+  // scopes, while Tranquil grants them. The required uploadBlob wildcard
+  // still authorizes PDS-minted service tokens for the multipart service.
+  ...VIDEO_METHODS.map((method) => rpcScope(method, VIDEO_SERVICE_AUDIENCE))
 ].join(" ");
 
 export function grantedScopeContainsRequired(grantedScope: string): boolean {
   const granted = new Set(grantedScope.split(/\s+/).filter(Boolean));
-  return PHASE2_OAUTH_SCOPE.split(" ").every((scope) => granted.has(scope));
+  if (granted.has("atproto")) return true;
+  return PHASE2_REQUIRED_SCOPES.every((scope) => granted.has(scope));
 }

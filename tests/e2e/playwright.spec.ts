@@ -113,4 +113,28 @@ test.describe("Netslum E2E Browser & API Suite", () => {
     const res = await request.get("/@nonexistent");
     expect(res.status()).toBe(404);
   });
+
+  test("session endpoint returns unauthenticated capabilities cleanly for guests", async ({ request }) => {
+    const res = await request.get("/api/session");
+    expect(res.status()).toBe(200);
+    const body = await res.json() as { authenticated: boolean; canPublishSite: boolean; reauthorizeRequired: boolean };
+    expect(body.authenticated).toBe(false);
+    expect(body.canPublishSite).toBe(false);
+    expect(body.reauthorizeRequired).toBe(false);
+  });
+
+  test("enforces authentication on protected phase 2 API routes", async ({ request }) => {
+    const dmsRes = await request.get("/api/dms/conversations");
+    expect(dmsRes.status()).toBe(401);
+
+    const imageRes = await request.post("/api/media/image/prepare", {
+      data: { mimeType: "image/png", sizeBytes: 1024 }
+    });
+    expect(imageRes.status()).toBe(401);
+
+    const previewRes = await request.post("/api/sites/preview-session", {
+      data: {}
+    });
+    expect(previewRes.status()).toBe(401);
+  });
 });

@@ -165,4 +165,23 @@ export class ChatService {
       return { allowIncoming: null };
     }
   }
+
+  async updateDeclaration(actorDid: string, allowIncoming: "all" | "following" | "none"): Promise<{ allowIncoming: string }> {
+    const client = await getOAuthClient(this.env);
+    const session = await client.restore(actorDid).catch(() => undefined);
+    if (!session) throw new NetslumError("AUTH_REQUIRED", "Please sign in again", 401);
+    const pds = new Agent(session);
+    await pds.com.atproto.repo.putRecord({
+      repo: actorDid,
+      collection: DECLARATION_COLLECTION,
+      rkey: "self",
+      record: {
+        $type: DECLARATION_COLLECTION,
+        allowIncoming
+      }
+    }, { signal: AbortSignal.timeout(8000) }).catch(() => {
+      throw new NetslumError("UPSTREAM_UNAVAILABLE", "Failed to update chat declaration", 502);
+    });
+    return { allowIncoming };
+  }
 }

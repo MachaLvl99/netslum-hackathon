@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>netslum webgpu district</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 0;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      background: #05070D;
+      color: #E8F0FF;
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+      display: flex;
+      flex-direction: column;
+    }
+    #header {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(10, 15, 26, 0.85);
+      border: 1px solid #1E293B;
+      padding: 8px 14px;
+      border-radius: 6px;
+      backdrop-filter: blur(8px);
+      pointer-events: none;
+    }
+    #header h1 {
+      margin: 0 0 4px 0;
+      font-size: 14px;
+      letter-spacing: 0.08em;
+      color: #00F0FF;
+      text-transform: uppercase;
+    }
+    #status {
+      margin: 0;
+      font-size: 11px;
+      color: #94A3B8;
+    }
+    #canvas-container {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <h1>District WebGPU Sandbox</h1>
+    <p id="status">Initializing GPU pipeline...</p>
+  </div>
+  <div id="canvas-container">
+    <canvas id="view-canvas"></canvas>
+  </div>
+
+  <script>
+    (async function initDistrict() {
+      const statusEl = document.getElementById("status");
+      const canvas = document.getElementById("view-canvas");
+
+      function setCanvasDimensions() {
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = Math.floor(canvas.clientWidth * dpr);
+        canvas.height = Math.floor(canvas.clientHeight * dpr);
+      }
+      setCanvasDimensions();
+      window.addEventListener("resize", setCanvasDimensions);
+
+      if (!navigator.gpu) {
+        renderFallback2D("WebGPU is not supported on this device/browser.");
+        return;
+      }
+
+      let adapter;
+      try {
+        adapter = await navigator.gpu.requestAdapter();
+      } catch (err) {
+        renderFallback2D("Failed to request WebGPU adapter: " + (err.message || err));
+        return;
+      }
+
+      if (!adapter) {
+        renderFallback2D("No WebGPU adapter available. Falling back to 2D canvas.");
+        return;
+      }
+
+      let device;
+      try {
+        device = await adapter.requestDevice();
+      } catch (err) {
+        renderFallback2D("Failed to acquire GPU device: " + (err.message || err));
+        return;
+      }
+
+      const context = canvas.getContext("webgpu");
+      if (!context) {
+        renderFallback2D("Failed to get WebGPU rendering context.");
+        return;
+      }
+
+      const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+      context.configure({
+        device,
+        format: presentationFormat,
+        alphaMode: "premultiplied",
+      });
+
+      const shaderModule = device.createShaderModule({
+        label: "Procedural District Grid",
+        code: `
+          struct Uniforms {
+            resolution: vec2<f32>,
+            time: f32,
+            pad: f32,
+          };
+
+          @group(0) @binding(0) var<uniform> u: Uniforms;
+
+          struct VertexOutput {
+            @builtin(position) position: vec4<f32>,
+            @location(0) uv: vec2<f32>,
+          };
+
+          @vertex
+          fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
+            var pos = array<vec2<f32>, 6>(
+              vec2<f32>(-1.0, -1.0),
+              vec2<f32>( 1.0, -1.0),
+              vec2<f32>(-1.0,  1.0),
+              vec2<f32>(-1.0,  1.0),
+              vec2<f32>( 1.0, -1.0),
+              vec2<f32>( 1.0,  1.0)
+            );
+            var output: VertexOutput;
+            output.position = vec4<f32>(pos[vertexIndex], 0.0, 1.0);
+            output.uv = (pos[vertexIndex] + vec2<f32>(1.0, 1.0)) * 0.5;
+            return output;
+          }
+
+          @fragment
+          fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+            let aspect = u.resolution.x / u.resolution.y;
+            var p = (uv - 0.5) * vec2<f32>(aspect, 1.0);
+
+            let t = u.time * 0.5;
+            let dist = length(p);
+            let angle = atan2(p.y, p.x);
+
+            // Cybernetic rings and grid lines
+            let rings = sin(dist * 24.0 - t * 3.0) * 0.5 + 0.5;
+            let gridX = abs(fract(p.x * 8.0 + sin(p.y * 4.0 + t) * 0.2) - 0.5);
+            let gridY = abs(fract(p.y * 8.0 + cos(p.x * 4.0 + t) * 0.2) - 0.5);
+            let grid = smoothstep(0.04, 0.0, min(gridX, gridY));
+
+            let neonCyan = vec3<f32>(0.0, 0.94, 1.0);
+            let neonMagenta = vec3<f32>(1.0, 0.0, 0.6);
+            let darkBg = vec3<f32>(0.02, 0.03, 0.07);
+
+            var col = mix(darkBg, neonCyan, grid * 0.6);
+            col = mix(col, neonMagenta, rings * (1.0 - smoothstep(0.0, 0.8, dist)) * 0.5);
+            col += neonCyan * (0.05 / (dist + 0.08));
+
+            return vec4<f32>(col, 1.0);
+          }
+        `,
+      });
+
+      const uniformBuffer = device.createBuffer({
+        size: 16, // 2 x f32 resolution, 1 x f32 time, 1 x f32 pad
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+
+      const bindGroupLayout = device.createBindGroupLayout({
+        entries: [{
+          binding: 0,
+          visibility: GPUShaderStage.FRAGMENT,
+          buffer: { type: "uniform" },
+        }],
+      });
+
+      const bindGroup = device.createBindGroup({
+        layout: bindGroupLayout,
+        entries: [{
+          binding: 0,
+          resource: { buffer: uniformBuffer },
+        }],
+      });
+
+      const pipelineLayout = device.createPipelineLayout({
+        bindGroupLayouts: [bindGroupLayout],
+      });
+
+      const pipeline = device.createRenderPipeline({
+        layout: pipelineLayout,
+        vertex: {
+          module: shaderModule,
+          entryPoint: "vs_main",
+        },
+        fragment: {
+          module: shaderModule,
+          entryPoint: "fs_main",
+          targets: [{ format: presentationFormat }],
+        },
+        primitive: {
+          topology: "triangle-list",
+        },
+      });
+
+      statusEl.textContent = "WebGPU Active • Procedural Shader";
+      statusEl.style.color = "#00F0FF";
+
+      const startTime = performance.now();
+      const uniformValues = new Float32Array(4);
+
+      function render() {
+        const time = (performance.now() - startTime) * 0.001;
+        uniformValues[0] = canvas.width;
+        uniformValues[1] = canvas.height;
+        uniformValues[2] = time;
+        uniformValues[3] = 0;
+        device.queue.writeBuffer(uniformBuffer, 0, uniformValues);
+
+        const commandEncoder = device.createCommandEncoder();
+        const textureView = context.getCurrentTexture().createView();
+        const renderPass = commandEncoder.beginRenderPass({
+          colorAttachments: [{
+            view: textureView,
+            clearValue: { r: 0.02, g: 0.03, b: 0.07, a: 1.0 },
+            loadOp: "clear",
+            storeOp: "store",
+          }],
+        });
+        renderPass.setPipeline(pipeline);
+        renderPass.setBindGroup(0, bindGroup);
+        renderPass.draw(6);
+        renderPass.end();
+
+        device.queue.submit([commandEncoder.finish()]);
+        requestAnimationFrame(render);
+      }
+
+      requestAnimationFrame(render);
+
+      function renderFallback2D(message) {
+        statusEl.textContent = "2D Fallback Active";
+        statusEl.style.color = "#F59E0B";
+
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+
+        let frame = 0;
+        function animate2D() {
+          const w = canvas.width;
+          const h = canvas.height;
+          ctx.fillStyle = "#05070D";
+          ctx.fillRect(0, 0, w, h);
+
+          // 2D Cyber grid
+          ctx.strokeStyle = "rgba(0, 240, 255, 0.15)";
+          ctx.lineWidth = 1;
+          const gridSize = 40;
+          const offset = (frame * 0.5) % gridSize;
+
+          for (let x = offset; x < w; x += gridSize) {
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, h);
+            ctx.stroke();
+          }
+          for (let y = offset; y < h; y += gridSize) {
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(w, y);
+            ctx.stroke();
+          }
+
+          // Fallback banner
+          ctx.fillStyle = "rgba(15, 23, 42, 0.9)";
+          ctx.strokeStyle = "#F59E0B";
+          ctx.lineWidth = 2;
+          const bannerW = Math.min(w - 40, 520);
+          const bannerH = 100;
+          const bx = (w - bannerW) / 2;
+          const by = (h - bannerH) / 2;
+          ctx.fillRect(bx, by, bannerW, bannerH);
+          ctx.strokeRect(bx, by, bannerW, bannerH);
+
+          ctx.fillStyle = "#F59E0B";
+          ctx.font = "bold 14px ui-monospace, Menlo, Consolas, monospace";
+          ctx.textAlign = "center";
+          ctx.fillText("WebGPU Unavailable • 2D Canvas Fallback", w / 2, by + 36);
+
+          ctx.fillStyle = "#94A3B8";
+          ctx.font = "12px ui-monospace, Menlo, Consolas, monospace";
+          ctx.fillText(message, w / 2, by + 68);
+
+          frame++;
+          requestAnimationFrame(animate2D);
+        }
+        requestAnimationFrame(animate2D);
+      }
+    })();
+  </script>
+</body>
+</html>

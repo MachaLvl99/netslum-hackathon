@@ -15,6 +15,7 @@
     "namespace": "netslum-sites-staging",
     "outbound": { "service": "netslum-site-egress" }
   }],
+  "services": [{ "binding": "SITE_RUNTIME", "service": "netslum-site-runtime" }],
   "vars": {
     "PUBLIC_URL": "https://netslum.macha.sh",
     "PDS_URL": "https://pds.netslum.macha.sh",

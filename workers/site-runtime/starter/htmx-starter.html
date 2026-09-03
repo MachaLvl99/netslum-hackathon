@@ -13,7 +13,7 @@
     htmx.config.allowScriptTags = false;
     htmx.config.historyCacheSize = 0;
     window.addEventListener("netslum:navigate", (event) => {
-      const detail = (event).detail;
+      const detail = event.detail;
       if (detail && typeof detail.route === "string") {
         window.parent.postMessage({ type: "netslum:trustedAction", action: "open-post", route: detail.route }, "https://netslum.macha.sh");
       }
@@ -21,13 +21,18 @@
   </script>
   <style>
     body { margin: 0; font-family: ui-monospace, Menlo, Consolas, monospace; background: #070910; color: #E8F0FF; padding: 16px; }
-    button { background: #101522; color: #57E6FF; border: 1px solid #2A3652; padding: 6px 12px; font: inherit; cursor: pointer; }
-    .post { border: 1px solid #2A3652; padding: 8px; margin: 8px 0; white-space: pre-wrap; }
+    button { background: #101522; color: #57E6FF; border: 1px solid #2A3652; padding: 8px 16px; font: inherit; cursor: pointer; margin-right: 8px; margin-bottom: 8px; border-radius: 4px; }
+    button:hover { background: #182035; border-color: #57E6FF; }
+    .container { margin-top: 16px; }
+    .fragment { border: 1px solid #2A3652; padding: 12px; margin: 8px 0; background: #0C101A; border-radius: 4px; white-space: pre-wrap; }
   </style>
 </head>
 <body>
-  <h2>town fragments via same-origin /api</h2>
-  <button hx-get="/api/home/bridge/town?limit=5" hx-target="#town" hx-swap="innerHTML">load town posts</button>
-  <div id="town"></div>
+  <h2>town & profile fragments via same-origin /api</h2>
+  <div>
+    <button hx-get="/api/fragments/town" hx-target="#output" hx-swap="innerHTML">load town fragment</button>
+    <button hx-get="/api/fragments/profile" hx-target="#output" hx-swap="innerHTML">load profile fragment</button>
+  </div>
+  <div id="output" class="container"></div>
 </body>
 </html>

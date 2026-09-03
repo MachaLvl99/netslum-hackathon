@@ -4,6 +4,8 @@
   "main": "src/assets.ts",
   "compatibility_date": "2026-08-27",
   "workers_dev": true,
+  "routes": [{ "pattern": "*.sites.netslum.macha.sh/*", "custom_domain": false, "zone_name": "macha.sh" }],
+  "services": [{ "binding": "SITE_RUNTIME", "service": "netslum-site-runtime" }],
   "d1_databases": [{ "binding": "DB", "database_name": "netslum", "database_id": "a350f70d-3550-4801-87c1-ec9bbdd85993" }],
   "r2_buckets": [{ "binding": "SITE_FILES", "bucket_name": "netslum-sites", "preview_bucket_name": "netslum-sites-preview" }],
   "vars": { "SITE_RUNTIME_ORIGIN": "https://netslum-site-runtime.ryan-a27.workers.dev" }

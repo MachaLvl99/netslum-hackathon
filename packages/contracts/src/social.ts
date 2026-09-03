@@ -3,7 +3,7 @@ import { revisionSchema, sha256Hex } from "./sites.js";
 
 export const atUriSchema = z.string().regex(/^at:\/\/did:[a-z0-9:%._-]+\/[a-zA-Z0-9.-]+\/[a-zA-Z0-9._~:@!$&'()*+,;=-]+$/).max(2048);
 export const cidSchema = z.string().min(10).max(200).regex(/^[A-Za-z0-9]+$/);
-export const feedQuerySchema = z.object({ cursor: z.string().max(512).optional(), limit: z.coerce.number().int().min(1).max(5).default(5) }).strict();
+export const feedQuerySchema = z.object({ cursor: z.string().max(512).optional(), limit: z.coerce.number().int().min(1).max(50).default(5) }).strict();
 export const preparePostSchema = z.object({ text: z.string().max(4000), replyToUri: atUriSchema.optional(), expectedRevision: revisionSchema.nullable() }).strict();
 export const publishPostSchema = z.object({ draftRevision: revisionSchema }).strict();
 export const reactionSchema = z.object({ uri: atUriSchema, cid: cidSchema, action: z.enum(["like", "unlike", "repost", "unrepost"]) }).strict();
